@@ -63,44 +63,63 @@
 4. `git diff` 再レビュー（入力＋出力, 承認ゲート②）
 5. 上記が乗った会話コンテキストの累積
 
+境界が曖昧なため **2 値で扱う**（詳細は 6.2）:
+- **狭義 direct overhead**: 上記 1〜4 に直接対応するメッセージのみ。純節約の計算に使う。
+- **全処理トークン（参考）**: 5 の文脈累積を含む上限的指標。
+
 ```
-純節約 = 推定 Claude 回避量 − Claude オーバーヘッド
+純節約 = 推定 Claude 回避量 − Claude オーバーヘッド（狭義 direct）
 ```
 
 ## 6. 計測ロジック
 
 ### 6.1 Codex 消費トークン（セッション単位）
-- 二重計上を避けるため、各セッションについて **最終ターンの累積 `total_tokens`** を採用する
-  （= そのセッションが消費したトークンの近似）。
-- 累積でなくターンごとに独立に記録される版に備え、実装時に「累積か独立か」を最初の数ターンで判定し、
-  - 累積なら最終値、
-  - 独立なら総和、
-  を取るフォールバックを持たせる。
+- セッションログには 2 種の token 情報があることを確認済み:
+  - `total_token_usage`: **累積**（ターン進行で増える）。
+  - `last_token_usage`: **そのターン単体**の消費。
+- **既定 = `last_token_usage.total_tokens` の総和**（増分和）。compaction やモデル/コンテキスト reset で
+  累積値が非単調になっても歪まないため。
+- `last_token_usage` が全ターンに無いセッションは、**最終ターンの累積 `total_token_usage.total_tokens` に fallback**。
+- どちらも欠落するセッションは集計対象外（後述エッジケース）。
 
 ### 6.2 Claude オーバーヘッド
 - `~/.claude/projects/**/*.jsonl` を走査。
-- `codex` / `codex-reply` の `tool_use` を含む assistant ターン、およびその直後の tool_result を処理するターンの
-  `usage` を「委譲オーバーヘッド」として合算する。
-- 既定のトークン数え方 = **全処理トークン**:
-  `input_tokens + cache_creation_input_tokens + cache_read_input_tokens + output_tokens`。
+- **dedupe（重要）**: 同一 assistant メッセージが複数 JSONL 行に分割される（ストリーミング等）。
+  行単位で `usage` を合算すると二重計上になるため、**`message.id`（無ければ `requestId`）でグルーピングし、
+  メッセージ単位で 1 回だけ**カウントする。
+- **2 ビューで表示**（境界の曖昧さを正直に出す）:
+  - **狭義 direct overhead**: `mcp__codex__codex` / `codex-reply` の `tool_use` を含むメッセージ＋その tool_result を
+    処理する直後のメッセージのみ。委譲の「手間賃」に近い。
+  - **全処理トークン**: 委譲が関与したセッション全体で処理した token（巨大な会話コンテキスト累積を含む上限的指標）。
+  純節約の既定計算には **狭義 direct overhead** を用い、全処理トークンは参考表示。
+- トークン数え方 = `input_tokens + cache_creation_input_tokens + cache_read_input_tokens + output_tokens`。
   （`--no-cache` 指定時は `input_tokens + output_tokens` のみ＝キャッシュ分を除外。）
 
 ### 6.3 attribution（突き合わせ）
-- 一次フィルタ: Codex セッションの `source == "mcp"`。
-- 期間フィルタ: `--since`（既定: スキル初コミット日 2026-06-03、または無指定で全期間）。
-- プロジェクトフィルタ: `--cwd <substr>`（任意, `cwd` 部分一致）。
-- セッション×Claude ターンの 1:1 紐付けは **best-effort**:
-  - Codex `id` ↔ Claude tool_result 内の `threadId` が一致すれば厳密リンク。
-  - 取れない場合は時刻近接でゆるく対応付け、ヘッドライン集計（総和）は紐付け不要で算出。
+`source:"mcp"` は **MCP 経由の Codex 利用すべて**を拾うため、このスキル以外の MCP-Codex 利用が混ざる
+false positive がある。2 モードを用意する。
+
+- **broad（既定）**: Codex セッションの `source == "mcp"` を委譲とみなす総和集計。手軽だが上限寄り。
+- **`--strict`**: Claude transcript 側の `mcp__codex__codex` / `codex-reply` の `tool_result` に含まれる
+  `threadId` を集め、Codex セッションの `id` と一致するものだけを採用。このスキル由来をほぼ確実に切り出す。
+- 期間フィルタ: `--since`。**Codex の timestamp は UTC** なので、引数も **UTC 基準**で解釈する旨を明記
+  （JST の 06-03 早朝が UTC では 06-02 に見えるズレに注意）。既定は無指定＝全期間。
+- プロジェクトフィルタ: `--cwd <substr>`（部分一致）。過剰一致を避けたい時は `--cwd-exact`（正規化 path 完全一致）。
+- セッション×Claude ターンの 1:1 紐付けは `threadId` ↔ `id` で行い、内訳テーブルに用いる。
+  ヘッドライン総和は紐付け不要で算出できる。
 
 ### 6.4 反実仮想（Claude 換算）
 ```
 推定 Claude 回避量 = k × (Codex 委譲ぶんの総消費トークン)
-純節約            = 推定 Claude 回避量 − Claude オーバーヘッド総和
+純節約            = 推定 Claude 回避量 − Claude オーバーヘッド総和（狭義 direct）
 ```
 - `k`: 「同じ仕事を Claude がやったら Codex の何倍トークンを使うか」の換算係数。
-- 既定 `k = 1.0`（保守的: Codex の仕事量をそのまま Claude 換算の下限とみなす）。
-- `--k` で上書き可能。レポートには複数 `k`（例 1.0 / 1.5）の感度も併記。
+- **`k=1.0` は「下限」ではなく「未校正の中立 baseline」**。`k` は単なるトークナイザ差ではなく、
+  モデルの問題解決効率差・Codex 側の tool/read/write 試行回数・委譲ブリーフ・base instructions・
+  cache 条件・「要約だけ返す」運用による Claude 入力削減などを**すべて吸収する未校正係数**。
+  Claude が Codex より少ないトークンで済む場合もあり得るため、下限保証はない。
+- レポートは単一値でなく **感度表を既定表示**: `k = 0.5 / 1.0 / 1.5 / 2.0`。注記で「仮定 k に基づく反実仮想」と明記。
+- `--k` で基準値を上書き可能。
 - 校正方法（任意・将来）: 代表タスクを「Claude インライン」と「Codex 委譲」両方で走らせ、
   `r = Claudeトークン / Codexトークン` を実測して `k=r` に差し替える。
 
@@ -111,53 +130,70 @@
 | 関数 | 役割 | 入力 | 出力 |
 |---|---|---|---|
 | `iter_codex_sessions(root)` | セッションファイル列挙 | ルートパス | パスのイテレータ |
-| `parse_codex_session(path)` | メタ＋トークン抽出 | パス | `{id, source, cwd, ts, codex_tokens}` |
-| `collect_codex(root, since, cwd_filter)` | mcp 委譲のみ集約 | フィルタ | セッション dict の list |
-| `parse_claude_transcript(path)` | 委譲ターンの usage 抽出 | パス | overhead レコード list |
-| `collect_claude(root, since)` | 全 transcript 集約 | フィルタ | overhead レコード list |
-| `compute(codex, claude, k)` | 反実仮想・純節約算出 | 集計＋k | レポート用 dict |
-| `render(report, ks)` | テキスト整形 | dict | str |
+| `parse_codex_session(path)` | メタ＋トークン抽出（増分和／fallback） | パス | `{id, source, cwd, ts_utc, codex_tokens}` |
+| `collect_codex(root, since_utc, cwd_filter)` | mcp 委譲のみ集約 | フィルタ | セッション dict の list |
+| `parse_claude_transcript(path)` | `message.id` dedupe→委譲ターンの usage 抽出（direct/全処理 の2値, threadId 付き） | パス | overhead レコード list |
+| `collect_claude(root, since_utc)` | 全 transcript 集約 | フィルタ | overhead レコード list |
+| `link(codex, claude)` | `threadId`↔`id` 紐付け（strict 用 / 内訳用） | 両集計 | リンク済みペア list |
+| `compute(codex, claude, ks, strict)` | 反実仮想・純節約を複数 k で算出 | 集計＋k 群 | レポート用 dict |
+| `render(report)` | 感度表込みのテキスト整形 | dict | str |
 | `main(argv)` | CLI 引数処理 | argv | 終了コード |
 
 CLI 例:
 ```
-python3 scripts/savings.py --since 2026-06-01 --cwd daily-news --k 1.0
-python3 scripts/savings.py            # 全期間・全プロジェクト・k=1.0
+python3 scripts/savings.py --since 2026-06-01 --cwd daily-news        # broad, UTC基準, 感度表
+python3 scripts/savings.py --strict --cwd-exact /Users/yumaohno/daily-news
+python3 scripts/savings.py            # 全期間・全プロジェクト・broad・k 既定群(0.5/1/1.5/2)
 ```
 
 ## 8. 出力イメージ
 
 ```
-codex-orchestration 節約レポート（2026-06-02〜06-03, source=mcp）
+codex-orchestration 節約レポート（UTC 2026-06-02〜06-03, attribution=broad[source:mcp]）
 委譲セッション数: 7   対象プロジェクト: daily-news, ...
 ─────────────────────────────────────────────
-Codex がやった仕事         : 1,240,000 tok   ← Pro 枠から外した分
-Claude オーケストレーション :    38,000 tok   ← 実際に払った overhead
+Codex がやった仕事            : 1,240,000 tok   ← Pro 枠から外した分
+Claude overhead (狭義 direct) :    38,000 tok   ← 委譲の手間賃（純節約計算に使用）
+Claude 全処理トークン(参考)   :   210,000 tok   ← 文脈累積込みの上限的指標
 ─────────────────────────────────────────────
-推定 Claude 回避量 (k=1.0) : 1,240,000 tok
-純節約 (k=1.0)             : 1,202,000 tok   (約 32倍のレバレッジ)
-感度: k=1.5 → 純節約 1,822,000 tok
+純節約 sensitivity（仮定 k に基づく反実仮想）:
+  k=0.5  ->   582,000 tok
+  k=1.0  -> 1,202,000 tok
+  k=1.5  -> 1,822,000 tok
+  k=2.0  -> 2,442,000 tok
+注: k は Claude/Codex 間の tokenizer・モデル挙動・cache 条件・委譲運用差を含む未校正係数。下限保証ではない。
 
-セッション別内訳:
-  2026-06-03 07:29  daily-news/.claude/worktrees/...   Codex  61,285  Claude  5,400
+セッション別内訳（threadId リンク, 取れた分）:
+  2026-06-03 07:29Z  daily-news/.claude/worktrees/...  Codex 61,285  Claude(direct) 5,400
   ...
 ```
 
 ## 9. エッジケース / 注意
 
 - **トークン currency の差**: Claude と Codex はトークナイザ/モデルが異なる。合算は近似であり、`k` で吸収する旨をレポートに明記。
-- **累積 vs 独立トークン**: 6.1 のフォールバックで対応。
+- **累積の非単調**: compaction/コンテキスト reset で `total_token_usage` が減ることがある。6.1 の増分和（`last_token_usage`）を既定にして回避。
+- **token 情報欠落セッション**: `last_token_usage` も `total_token_usage` も無いものは集計対象外。
 - **`source` キー欠落の古いセッション**: `source` 不明は集計対象外（mcp と確証できないため）。
-- **Claude 側で threadId 取得不可**: ヘッドライン総和は紐付け不要で算出、内訳のリンクのみ best-effort。
-- **複数プロジェクト混在**: 既定は全プロジェクト合算、`--cwd` で絞り込み。
+- **同一 Claude メッセージ内の複数 `codex` 呼び出し**: メッセージ単位 dedupe 後、tool_use 数ぶんの委譲として扱う（overhead は二重計上しない）。
+- **`codex-reply` の継続**: 同一 Codex `id` の継続は 1 セッションとして集計し、別セッションに重複カウントしない。
+- **sidechain / subagent transcript**: 既定では除外（委譲の overhead は親セッションに現れるため）。`--include-sidechains` で任意包含。
+- **`threadId` の返り形式ゆれ**: tool_result が文字列/ネスト JSON 等で返る場合に備え、複数パターンで `threadId` を抽出。取れなければ broad 総和のみ採用。
+- **malformed / 途中切れ JSONL**: 行単位 try/except でスキップし、壊れた 1 行で全体を落とさない。
+- **タイムゾーン**: Codex timestamp は UTC。`--since` も UTC 解釈、表示も UTC 明示（`Z` 付き）。
+- **複数プロジェクト混在**: 既定は全プロジェクト合算、`--cwd`(部分一致)/`--cwd-exact`(完全一致) で絞り込み。
 - **ログのローテーション/削除**: 残存ログのみが対象（明記）。
 
 ## 10. テスト方針（TDD）
 
-- `parse_codex_session`: 累積トークンの fixture → 最終値を返す / 独立トークン fixture → 総和を返す。
-- `collect_codex`: `source` 混在・期間・cwd フィルタの分岐。
-- `parse_claude_transcript`: `codex` tool_use を含むターンだけ拾う / 含まないターンは無視。
-- `compute`: k=1.0 / k=1.5 で推定回避量・純節約が定義通り。
+- `parse_codex_session`: `last_token_usage` 有り fixture → 増分和 / 無し fixture → 最終累積へ fallback / 両欠落 → 除外。
+- `parse_codex_session`: 累積が非単調（compaction）な fixture でも増分和が正しい。
+- `collect_codex`: `source`（mcp/exec/cli/欠落）混在・期間(UTC)・cwd(部分/完全)フィルタの分岐。
+- `parse_claude_transcript`: 同一 `message.id` が複数行に分割された fixture → 1 回だけ計上（dedupe）。
+- `parse_claude_transcript`: `codex` tool_use を含むメッセージだけ direct overhead に拾う / 含まないものは無視。
+- `parse_claude_transcript`: 1 メッセージ内に複数 `codex` tool_use があっても overhead を二重計上しない。
+- `link`: `threadId`↔`id` の一致/不一致、`threadId` 形式ゆれ（文字列/ネスト）での抽出。
+- `compute`: k=0.5/1.0/1.5/2.0 の感度値、純節約＝推定回避量−狭義 direct overhead が定義通り。
+- malformed JSONL 行を含む fixture → スキップして他行は集計継続。
 - すべて小さな JSONL fixture（実ログの一部を模した最小データ）で検証。実ホームのログには依存しない。
 
 ## 11. 配置 / 成果物
