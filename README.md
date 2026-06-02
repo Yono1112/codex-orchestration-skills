@@ -28,6 +28,13 @@ ln -s "$(pwd)" ~/.claude/skills/codex-orchestration
 
 普段どおり Claude Code を使う。トークンの重い実行（機能実装・TDD・広域調査・大きい差分のレビュー）に差し掛かると、このスキルに従って Claude が「Codex に委譲していいか」を確認し、承認後に Codex へ委譲、戻ってきた差分を Claude が再レビューする。superpowers の委譲ポイント（`executing-plans` など）の最中にも差し込める。
 
+## 節約量の計測
+
+`python3 scripts/savings.py` で残存ログ全期間を broad attribution（`source:"mcp"`）で集計する。この環境では MCP-Codex セッションが本スキルの委譲のみであることを実測確認済みで、`--since 2026-06-01` は UTC 基準の期間フィルタとして扱う。
+プロジェクトは `--cwd daily-news`（部分一致）または `--cwd-exact /path/to/project`（正規化パス完全一致）で絞り込む。
+出力は `k=0.5/1.0/1.5/2.0` の感度表を含み、純節約は「推定 Claude 回避量 − Claude overhead（狭義 direct）」として表示する。
+`k` は tokenizer・モデル挙動・cache 条件・委譲運用差を含む未校正係数で、下限保証ではない。
+
 ## 編集・更新
 
 - `SKILL.md` を編集すれば（symlink 経由でも）テキストはライブ反映される。
