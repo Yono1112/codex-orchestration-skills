@@ -315,3 +315,52 @@ def compute(
         "codex_sessions": unique_codex,
         "projects": sorted({session.get("cwd", "") for session in unique_codex if session.get("cwd")}),
     }
+
+
+def _format_int(value: int) -> str:
+    return f"{value:,}"
+
+
+def _format_utc(dt: datetime | None) -> str:
+    if dt is None:
+        return "unknown"
+    return dt.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def render(report: dict[str, Any], since_utc: datetime | None = None) -> str:
+    since_text = f"since {_format_utc(since_utc)}" if since_utc else "all time"
+    projects = report.get("projects", [])
+    project_text = ", ".join(projects) if projects else "all projects"
+
+    lines = [
+        f"codex-orchestration 節約レポート（UTC {since_text}, attribution={report['attribution']}）",
+        f"委譲セッション数: {report['codex_session_count']}   対象プロジェクト: {project_text}",
+        "─────────────────────────────────────────────",
+        f"Codex がやった仕事            : {_format_int(report['codex_tokens'])} tok",
+        f"Claude overhead (狭義 direct) : {_format_int(report['claude_direct_tokens'])} tok",
+        f"Claude 全処理トークン(参考)   : {_format_int(report['claude_total_tokens'])} tok",
+        "─────────────────────────────────────────────",
+        "純節約 sensitivity（仮定 k に基づく反実仮想）:",
+    ]
+
+    for row in report.get("sensitivity", []):
+        lines.append(f"  k={row['k']:.1f}  -> {_format_int(row['net_savings_tokens'])} tok")
+
+    lines.extend([
+        "注: k は Claude/Codex 間の tokenizer・モデル挙動・cache 条件・委譲運用差を含む未校正係数。下限保証ではない。",
+        "注: ログのローテーションや削除がある場合、残存ログのみが対象。",
+        "",
+        "Codex セッション一覧（日付UTC / cwd / Codex トークン）:",
+    ])
+
+    codex_sessions = report.get("codex_sessions", [])
+    if codex_sessions:
+        for codex in codex_sessions:
+            lines.append(
+                f"  {_format_utc(codex.get('ts_utc'))}  {codex.get('cwd', '')}  "
+                f"Codex {_format_int(codex.get('codex_tokens', 0))}"
+            )
+    else:
+        lines.append("  Codex sessions: 0")
+
+    return "\n".join(lines) + "\n"

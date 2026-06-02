@@ -357,3 +357,41 @@ class ComputeTests(SavingsTestCase):
             {"k": 1.0, "avoided_tokens": 400, "net_savings_tokens": 340},
             {"k": 2.0, "avoided_tokens": 800, "net_savings_tokens": 740},
         ])
+
+
+class RenderTests(SavingsTestCase):
+    def test_render_outputs_headline_sensitivity_and_codex_session_breakdown(self):
+        report = {
+            "attribution": "broad[source:mcp]",
+            "codex_session_count": 1,
+            "codex_tokens": 1240000,
+            "claude_direct_tokens": 38000,
+            "claude_total_tokens": 210000,
+            "projects": ["/repo/daily-news"],
+            "sensitivity": [
+                {"k": 0.5, "avoided_tokens": 620000, "net_savings_tokens": 582000},
+                {"k": 1.0, "avoided_tokens": 1240000, "net_savings_tokens": 1202000},
+            ],
+            "codex_sessions": [
+                {
+                    "id": "codex-a",
+                    "cwd": "/repo/daily-news",
+                    "ts_utc": savings._parse_utc("2026-06-03T07:29:00Z"),
+                    "codex_tokens": 61285,
+                },
+            ],
+        }
+
+        text = savings.render(report, since_utc=savings._parse_utc("2026-06-02T00:00:00Z"))
+
+        self.assertIn("codex-orchestration 節約レポート（UTC since 2026-06-02T00:00:00Z, attribution=broad[source:mcp]）", text)
+        self.assertIn("委譲セッション数: 1", text)
+        self.assertIn("Codex がやった仕事            : 1,240,000 tok", text)
+        self.assertIn("Claude overhead (狭義 direct) : 38,000 tok", text)
+        self.assertIn("Claude 全処理トークン(参考)   : 210,000 tok", text)
+        self.assertIn("k=0.5  -> 582,000 tok", text)
+        self.assertIn("k=1.0  -> 1,202,000 tok", text)
+        self.assertIn("下限保証ではない", text)
+        self.assertIn("残存ログのみが対象", text)
+        self.assertIn("Codex セッション一覧（日付UTC / cwd / Codex トークン）:", text)
+        self.assertIn("2026-06-03T07:29:00Z  /repo/daily-news  Codex 61,285", text)
