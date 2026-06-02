@@ -236,3 +236,34 @@ def parse_claude_transcript(
         "total_tokens": sum(message["tokens"] for message in unique_messages),
         "tool_use_count": tool_use_count,
     }]
+
+
+def _first_timestamp(path: Path) -> datetime | None:
+    for row in _read_jsonl(path):
+        if isinstance(row, dict):
+            timestamp = row.get("timestamp")
+            if not isinstance(timestamp, str):
+                timestamp = _message_from_row(row).get("timestamp")
+            if isinstance(timestamp, str):
+                return _parse_utc(timestamp)
+    return None
+
+
+def collect_claude(
+    root: str | Path,
+    since_utc: datetime | None = None,
+    include_sidechains: bool = False,
+    include_cache: bool = True,
+) -> list[dict[str, Any]]:
+    root_path = Path(root)
+    if not root_path.exists():
+        return []
+
+    records: list[dict[str, Any]] = []
+    for path in sorted(root_path.rglob("*.jsonl")):
+        ts_utc = _first_timestamp(path)
+        if since_utc is not None and (ts_utc is None or ts_utc < since_utc):
+            continue
+        records.extend(parse_claude_transcript(path, include_sidechains=include_sidechains, include_cache=include_cache))
+
+    return records

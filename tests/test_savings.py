@@ -293,3 +293,42 @@ class ParseClaudeTranscriptTests(SavingsTestCase):
             records = savings.parse_claude_transcript(path)
 
             self.assertEqual(records[0]["direct_tokens"], 4)
+
+
+class CollectClaudeTests(SavingsTestCase):
+    def write_transcript(self, path, timestamp, message_id, sidechain=False):
+        self.write_jsonl(path, [
+            {"type": "assistant", "timestamp": timestamp, "isSidechain": sidechain, "message": {
+                "id": message_id,
+                "usage": {
+                    "input_tokens": 10,
+                    "cache_creation_input_tokens": 0,
+                    "cache_read_input_tokens": 0,
+                    "output_tokens": 5,
+                },
+                "content": [{"type": "tool_use", "name": "mcp__codex__codex", "input": {"prompt": "work"}}],
+            }},
+        ])
+
+    def test_collect_claude_reads_project_transcripts_and_filters_since(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self.write_transcript(root / "projects" / "repo" / "old.jsonl", "2026-06-01T00:00:00Z", "old")
+            self.write_transcript(root / "projects" / "repo" / "new.jsonl", "2026-06-03T00:00:00Z", "new")
+
+            records = savings.collect_claude(root, since_utc=savings._parse_utc("2026-06-02T00:00:00Z"))
+
+            self.assertEqual([Path(record["path"]).name for record in records], ["new.jsonl"])
+            self.assertEqual(records[0]["direct_tokens"], 15)
+
+    def test_collect_claude_excludes_sidechains_by_default_and_includes_when_requested(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self.write_transcript(root / "projects" / "repo" / "main.jsonl", "2026-06-03T00:00:00Z", "main", sidechain=False)
+            self.write_transcript(root / "projects" / "repo" / "side.jsonl", "2026-06-03T00:00:00Z", "side", sidechain=True)
+
+            default_records = savings.collect_claude(root)
+            included_records = savings.collect_claude(root, include_sidechains=True)
+
+            self.assertEqual([Path(record["path"]).name for record in default_records], ["main.jsonl"])
+            self.assertEqual([Path(record["path"]).name for record in included_records], ["main.jsonl", "side.jsonl"])
