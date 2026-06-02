@@ -164,3 +164,132 @@ class CollectCodexTests(SavingsTestCase):
             )
 
             self.assertEqual([session["id"] for session in sessions], ["keep"])
+
+
+class ParseClaudeTranscriptTests(SavingsTestCase):
+    def usage(self, input_tokens, cache_create, cache_read, output_tokens):
+        return {
+            "input_tokens": input_tokens,
+            "cache_creation_input_tokens": cache_create,
+            "cache_read_input_tokens": cache_read,
+            "output_tokens": output_tokens,
+        }
+
+    def test_dedupes_split_message_and_counts_codex_tool_use_once(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "project" / "session.jsonl"
+            self.write_jsonl(path, [
+                {"type": "assistant", "message": {
+                    "id": "msg-1",
+                    "usage": self.usage(10, 2, 3, 5),
+                    "content": [{"type": "tool_use", "name": "mcp__codex__codex", "input": {"prompt": "work"}}],
+                }},
+                {"type": "assistant", "message": {
+                    "id": "msg-1",
+                    "usage": self.usage(10, 2, 3, 5),
+                    "content": [{"type": "text", "text": "stream continuation"}],
+                }},
+                {"type": "assistant", "message": {
+                    "id": "msg-2",
+                    "usage": self.usage(20, 0, 0, 4),
+                    "content": [{"type": "text", "text": "ordinary assistant text"}],
+                }},
+            ])
+
+            records = savings.parse_claude_transcript(path)
+
+            self.assertEqual(len(records), 1)
+            self.assertEqual(records[0]["direct_tokens"], 20)
+            self.assertEqual(records[0]["total_tokens"], 44)
+            self.assertEqual(records[0]["tool_use_count"], 1)
+
+    def test_counts_multiple_codex_tool_uses_without_double_counting_overhead(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "project" / "session.jsonl"
+            self.write_jsonl(path, [
+                {"type": "assistant", "message": {
+                    "id": "msg-1",
+                    "usage": self.usage(100, 0, 0, 20),
+                    "content": [
+                        {"type": "tool_use", "name": "mcp__codex__codex", "input": {"prompt": "one"}},
+                        {"type": "tool_use", "name": "mcp__codex__codex-reply", "input": {"prompt": "two"}},
+                    ],
+                }},
+            ])
+
+            records = savings.parse_claude_transcript(path)
+
+            self.assertEqual(records[0]["direct_tokens"], 120)
+            self.assertEqual(records[0]["tool_use_count"], 2)
+
+    def test_counts_next_assistant_after_codex_tool_result_as_direct_overhead(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "project" / "session.jsonl"
+            self.write_jsonl(path, [
+                {"type": "user", "message": {"content": [{
+                    "type": "tool_result",
+                    "content": "codex completed",
+                }]}},
+                {"type": "assistant", "requestId": "request-1", "message": {
+                    "usage": self.usage(30, 1, 1, 8),
+                    "content": [{"type": "text", "text": "review result"}],
+                }},
+            ])
+
+            records = savings.parse_claude_transcript(path)
+
+            self.assertEqual(records[0]["direct_tokens"], 40)
+            self.assertEqual(records[0]["total_tokens"], 40)
+
+    def test_ignores_non_codex_messages_for_direct_overhead_but_keeps_session_total_when_delegation_exists(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "project" / "session.jsonl"
+            self.write_jsonl(path, [
+                {"type": "assistant", "message": {
+                    "id": "msg-1",
+                    "usage": self.usage(5, 0, 0, 5),
+                    "content": [{"type": "text", "text": "ordinary"}],
+                }},
+                {"type": "assistant", "message": {
+                    "id": "msg-2",
+                    "usage": self.usage(10, 0, 0, 1),
+                    "content": [{"type": "tool_use", "name": "mcp__codex__codex", "input": {"prompt": "work"}}],
+                }},
+            ])
+
+            records = savings.parse_claude_transcript(path)
+
+            self.assertEqual(records[0]["direct_tokens"], 11)
+            self.assertEqual(records[0]["total_tokens"], 21)
+
+    def test_no_cache_excludes_cache_creation_and_cache_read_tokens(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "project" / "session.jsonl"
+            self.write_jsonl(path, [
+                {"type": "assistant", "message": {
+                    "id": "msg-1",
+                    "usage": self.usage(10, 50, 60, 5),
+                    "content": [{"type": "tool_use", "name": "mcp__codex__codex", "input": {"prompt": "work"}}],
+                }},
+            ])
+
+            records = savings.parse_claude_transcript(path, include_cache=False)
+
+            self.assertEqual(records[0]["direct_tokens"], 15)
+            self.assertEqual(records[0]["total_tokens"], 15)
+
+    def test_malformed_lines_are_skipped(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "project" / "session.jsonl"
+            self.write_jsonl(path, [
+                "{not valid json",
+                {"type": "assistant", "message": {
+                    "id": "msg-1",
+                    "usage": self.usage(1, 1, 1, 1),
+                    "content": [{"type": "tool_use", "name": "mcp__codex__codex", "input": {"prompt": "work"}}],
+                }},
+            ])
+
+            records = savings.parse_claude_transcript(path)
+
+            self.assertEqual(records[0]["direct_tokens"], 4)

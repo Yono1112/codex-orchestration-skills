@@ -121,3 +121,118 @@ def collect_codex(
         sessions.append(session)
 
     return sessions
+
+
+CODEX_TOOL_NAMES = {
+    "mcp__codex__codex",
+    "mcp__codex__codex-reply",
+    "codex",
+    "codex-reply",
+}
+
+
+def _message_from_row(row: dict[str, Any]) -> dict[str, Any]:
+    message = row.get("message")
+    return message if isinstance(message, dict) else {}
+
+
+def _message_key(row: dict[str, Any], message: dict[str, Any], index: int) -> str:
+    message_id = message.get("id")
+    if isinstance(message_id, str):
+        return message_id
+    request_id = row.get("requestId") or message.get("requestId")
+    if isinstance(request_id, str):
+        return request_id
+    return f"row-{index}"
+
+
+def _usage_tokens(usage: dict[str, Any] | None, include_cache: bool) -> int:
+    if not isinstance(usage, dict):
+        return 0
+    keys = ["input_tokens", "output_tokens"]
+    if include_cache:
+        keys.extend(["cache_creation_input_tokens", "cache_read_input_tokens"])
+    return sum(value for key in keys if isinstance((value := usage.get(key)), int))
+
+
+def _content_items(message: dict[str, Any]) -> list[Any]:
+    content = message.get("content", [])
+    if isinstance(content, list):
+        return content
+    return [content]
+
+
+def _is_codex_tool_use(item: Any) -> bool:
+    return isinstance(item, dict) and item.get("type") == "tool_use" and item.get("name") in CODEX_TOOL_NAMES
+
+
+def _contains_codex_marker(value: Any) -> bool:
+    if isinstance(value, dict):
+        return any(_contains_codex_marker(child) for child in value.values())
+    if isinstance(value, list):
+        return any(_contains_codex_marker(child) for child in value)
+    if isinstance(value, str):
+        lowered = value.lower()
+        return "codex" in lowered or "threadid" in lowered
+    return False
+
+
+def _row_has_codex_tool_result(row: dict[str, Any]) -> bool:
+    message = _message_from_row(row)
+    for item in _content_items(message):
+        if isinstance(item, dict) and item.get("type") == "tool_result":
+            return _contains_codex_marker(item)
+    return False
+
+
+def parse_claude_transcript(
+    path: str | Path,
+    include_sidechains: bool = False,
+    include_cache: bool = True,
+) -> list[dict[str, Any]]:
+    unique_messages: list[dict[str, Any]] = []
+    seen_message_keys: set[str] = set()
+    next_assistant_is_direct = False
+
+    for index, row in enumerate(_read_jsonl(Path(path))):
+        if not isinstance(row, dict):
+            continue
+        if row.get("isSidechain") and not include_sidechains:
+            continue
+
+        if _row_has_codex_tool_result(row):
+            next_assistant_is_direct = True
+            continue
+
+        if row.get("type") != "assistant":
+            continue
+
+        message = _message_from_row(row)
+        key = _message_key(row, message, index)
+        if key in seen_message_keys:
+            continue
+        seen_message_keys.add(key)
+
+        content = _content_items(message)
+        codex_tool_items = [item for item in content if _is_codex_tool_use(item)]
+
+        is_direct = bool(codex_tool_items) or next_assistant_is_direct
+        next_assistant_is_direct = False
+
+        unique_messages.append({
+            "tokens": _usage_tokens(message.get("usage"), include_cache),
+            "is_direct": is_direct,
+            "tool_use_count": len(codex_tool_items),
+        })
+
+    direct_tokens = sum(message["tokens"] for message in unique_messages if message["is_direct"])
+    tool_use_count = sum(message["tool_use_count"] for message in unique_messages)
+    if direct_tokens == 0 and tool_use_count == 0:
+        return []
+
+    return [{
+        "path": str(Path(path)),
+        "direct_tokens": direct_tokens,
+        "total_tokens": sum(message["tokens"] for message in unique_messages),
+        "tool_use_count": tool_use_count,
+    }]
