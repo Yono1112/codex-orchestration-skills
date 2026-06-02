@@ -4,7 +4,7 @@
 
 **Goal:** Build a standard-library Python CLI that mines Codex and Claude logs to estimate Claude Pro token savings from Codex delegation.
 
-**Architecture:** `scripts/savings.py` is a single CLI module split into pure functions for parsing, collection, linking, computation, rendering, and argument handling. `tests/test_savings.py` uses small in-test JSONL fixtures and temporary directories so the suite never depends on `~/.codex` or `~/.claude`.
+**Architecture:** `scripts/savings.py` is a single CLI module split into pure functions for parsing, collection, computation, rendering, and argument handling. `tests/test_savings.py` uses small in-test JSONL fixtures and temporary directories so the suite never depends on `~/.codex` or `~/.claude`.
 
 **Tech Stack:** Python 3 標準ライブラリのみ（依存なし）。テストは `unittest`。
 
@@ -13,7 +13,7 @@
 ## File Structure
 
 - Create: `scripts/savings.py`
-  - Responsibility: Parse Codex session JSONL and Claude transcript JSONL, filter sessions, link `threadId` to Codex session `id`, compute counterfactual savings for multiple `k` values, render a text report, and expose a CLI.
+  - Responsibility: Parse Codex session JSONL and Claude transcript JSONL, filter sessions, compute broad-attribution counterfactual savings for multiple `k` values, render a text report, and expose a CLI.
 - Create: `tests/test_savings.py`
   - Responsibility: Unit-test each pure component with small JSONL fixtures created inside `tempfile.TemporaryDirectory`; no tests read real home-directory logs.
 - Modify: `README.md`
@@ -469,7 +469,7 @@ class ParseClaudeTranscriptTests(SavingsTestCase):
                     "usage": self.usage(100, 0, 0, 20),
                     "content": [
                         {"type": "tool_use", "name": "mcp__codex__codex", "input": {"prompt": "one"}},
-                        {"type": "tool_use", "name": "mcp__codex__codex-reply", "input": {"threadId": "codex-a", "prompt": "two"}},
+                        {"type": "tool_use", "name": "mcp__codex__codex-reply", "input": {"prompt": "two"}},
                     ],
                 }},
             ])
@@ -478,7 +478,6 @@ class ParseClaudeTranscriptTests(SavingsTestCase):
 
             self.assertEqual(records[0]["direct_tokens"], 120)
             self.assertEqual(records[0]["tool_use_count"], 2)
-            self.assertEqual(records[0]["thread_ids"], ["codex-a"])
 
     def test_counts_next_assistant_after_codex_tool_result_as_direct_overhead(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -486,7 +485,7 @@ class ParseClaudeTranscriptTests(SavingsTestCase):
             self.write_jsonl(path, [
                 {"type": "user", "message": {"content": [{
                     "type": "tool_result",
-                    "content": "{\"threadId\":\"codex-from-result\"}",
+                    "content": "codex completed",
                 }]}},
                 {"type": "assistant", "requestId": "request-1", "message": {
                     "usage": self.usage(30, 1, 1, 8),
@@ -498,7 +497,6 @@ class ParseClaudeTranscriptTests(SavingsTestCase):
 
             self.assertEqual(records[0]["direct_tokens"], 40)
             self.assertEqual(records[0]["total_tokens"], 40)
-            self.assertEqual(records[0]["thread_ids"], ["codex-from-result"])
 
     def test_ignores_non_codex_messages_for_direct_overhead_but_keeps_session_total_when_delegation_exists(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -613,39 +611,22 @@ def _is_codex_tool_use(item: Any) -> bool:
     return isinstance(item, dict) and item.get("type") == "tool_use" and item.get("name") in CODEX_TOOL_NAMES
 
 
-def _extract_thread_ids_from_value(value: Any) -> set[str]:
-    found: set[str] = set()
+def _contains_codex_marker(value: Any) -> bool:
     if isinstance(value, dict):
-        for key, child in value.items():
-            if key == "threadId" and isinstance(child, str):
-                found.add(child)
-            else:
-                found.update(_extract_thread_ids_from_value(child))
-    elif isinstance(value, list):
-        for child in value:
-            found.update(_extract_thread_ids_from_value(child))
-    elif isinstance(value, str):
-        stripped = value.strip()
-        if stripped:
-            try:
-                found.update(_extract_thread_ids_from_value(json.loads(stripped)))
-            except json.JSONDecodeError:
-                marker = "threadId"
-                if marker in stripped:
-                    parts = stripped.replace("=", ":").replace(",", " ").split()
-                    for index, part in enumerate(parts):
-                        if marker in part and index + 1 < len(parts):
-                            candidate = parts[index + 1].strip("\"':{}")
-                            if candidate:
-                                found.add(candidate)
-    return found
+        return any(_contains_codex_marker(child) for child in value.values())
+    if isinstance(value, list):
+        return any(_contains_codex_marker(child) for child in value)
+    if isinstance(value, str):
+        lowered = value.lower()
+        return "codex" in lowered or "threadid" in lowered
+    return False
 
 
 def _row_has_codex_tool_result(row: dict[str, Any]) -> bool:
     message = _message_from_row(row)
     for item in _content_items(message):
         if isinstance(item, dict) and item.get("type") == "tool_result":
-            return bool(_extract_thread_ids_from_value(item))
+            return _contains_codex_marker(item)
     return False
 
 
@@ -656,7 +637,6 @@ def parse_claude_transcript(
 ) -> list[dict[str, Any]]:
     unique_messages: list[dict[str, Any]] = []
     seen_message_keys: set[str] = set()
-    thread_ids: set[str] = set()
     next_assistant_is_direct = False
 
     for index, row in enumerate(_read_jsonl(Path(path))):
@@ -666,7 +646,6 @@ def parse_claude_transcript(
             continue
 
         if _row_has_codex_tool_result(row):
-            thread_ids.update(_extract_thread_ids_from_value(row))
             next_assistant_is_direct = True
             continue
 
@@ -681,8 +660,6 @@ def parse_claude_transcript(
 
         content = _content_items(message)
         codex_tool_items = [item for item in content if _is_codex_tool_use(item)]
-        for item in codex_tool_items:
-            thread_ids.update(_extract_thread_ids_from_value(item))
 
         is_direct = bool(codex_tool_items) or next_assistant_is_direct
         next_assistant_is_direct = False
@@ -695,12 +672,11 @@ def parse_claude_transcript(
 
     direct_tokens = sum(message["tokens"] for message in unique_messages if message["is_direct"])
     tool_use_count = sum(message["tool_use_count"] for message in unique_messages)
-    if direct_tokens == 0 and tool_use_count == 0 and not thread_ids:
+    if direct_tokens == 0 and tool_use_count == 0:
         return []
 
     return [{
         "path": str(Path(path)),
-        "thread_ids": sorted(thread_ids),
         "direct_tokens": direct_tokens,
         "total_tokens": sum(message["tokens"] for message in unique_messages),
         "tool_use_count": tool_use_count,
@@ -849,117 +825,7 @@ git add scripts/savings.py tests/test_savings.py
 git commit -m "feat: collect claude overhead records"
 ```
 
-## Task 5: `link`
-
-**Files:**
-- Modify: `scripts/savings.py`
-- Modify: `tests/test_savings.py`
-- Test: `tests/test_savings.py`
-
-- [ ] **Step 1: Write the failing test**
-
-Append to `tests/test_savings.py`:
-
-```python
-class LinkTests(SavingsTestCase):
-    def test_link_matches_codex_session_id_to_claude_thread_id(self):
-        codex = [
-            {"id": "codex-a", "cwd": "/repo/a", "codex_tokens": 100, "ts_utc": savings._parse_utc("2026-06-03T00:00:00Z")},
-            {"id": "codex-b", "cwd": "/repo/b", "codex_tokens": 200, "ts_utc": savings._parse_utc("2026-06-03T01:00:00Z")},
-        ]
-        claude = [
-            {"path": "one.jsonl", "thread_ids": ["codex-a"], "direct_tokens": 10, "total_tokens": 50},
-            {"path": "two.jsonl", "thread_ids": ["missing"], "direct_tokens": 20, "total_tokens": 60},
-        ]
-
-        pairs = savings.link(codex, claude)
-
-        self.assertEqual(len(pairs), 1)
-        self.assertEqual(pairs[0]["thread_id"], "codex-a")
-        self.assertEqual(pairs[0]["codex"]["codex_tokens"], 100)
-        self.assertEqual(pairs[0]["claude"]["direct_tokens"], 10)
-
-    def test_thread_id_extraction_handles_nested_and_string_tool_results(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            path = Path(tmp) / "session.jsonl"
-            self.write_jsonl(path, [
-                {"type": "assistant", "message": {
-                    "id": "msg-1",
-                    "usage": {"input_tokens": 1, "output_tokens": 1},
-                    "content": [{"type": "tool_use", "name": "mcp__codex__codex-reply", "input": {"nested": {"threadId": "nested-id"}}}],
-                }},
-                {"type": "user", "message": {"content": [{
-                    "type": "tool_result",
-                    "content": "{\"data\":{\"threadId\":\"string-id\"}}",
-                }]}},
-                {"type": "assistant", "message": {
-                    "id": "msg-2",
-                    "usage": {"input_tokens": 1, "output_tokens": 1},
-                    "content": [{"type": "text", "text": "processed"}],
-                }},
-            ])
-
-            records = savings.parse_claude_transcript(path)
-
-            self.assertEqual(records[0]["thread_ids"], ["nested-id", "string-id"])
-```
-
-- [ ] **Step 2: Run test to verify it fails**
-
-Run: `python3 -m unittest tests.test_savings.LinkTests -v`
-
-Expected output:
-
-```text
-AttributeError: module 'scripts.savings' has no attribute 'link'
-FAILED (errors=1)
-```
-
-- [ ] **Step 3: Write minimal implementation**
-
-Add to `scripts/savings.py`:
-
-```python
-def link(codex: list[dict[str, Any]], claude: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    codex_by_id = {
-        session.get("id"): session
-        for session in codex
-        if isinstance(session.get("id"), str)
-    }
-    pairs: list[dict[str, Any]] = []
-    for overhead in claude:
-        for thread_id in overhead.get("thread_ids", []):
-            session = codex_by_id.get(thread_id)
-            if session is not None:
-                pairs.append({
-                    "thread_id": thread_id,
-                    "codex": session,
-                    "claude": overhead,
-                })
-    return pairs
-```
-
-- [ ] **Step 4: Run test to verify it passes**
-
-Run: `python3 -m unittest tests.test_savings.LinkTests -v`
-
-Expected output:
-
-```text
-test_link_matches_codex_session_id_to_claude_thread_id ... ok
-test_thread_id_extraction_handles_nested_and_string_tool_results ... ok
-
-OK
-```
-
-- [ ] **Step 5: Commit**
-
-```bash
-git add scripts/savings.py tests/test_savings.py
-git commit -m "feat: link codex sessions to claude threads"
-```
-
-## Task 6: `compute`
+## Task 5: `compute`
 
 **Files:**
 - Modify: `scripts/savings.py`
@@ -978,11 +844,11 @@ class ComputeTests(SavingsTestCase):
             {"id": "codex-b", "cwd": "/repo/b", "codex_tokens": 300, "ts_utc": savings._parse_utc("2026-06-03T01:00:00Z")},
         ]
         claude = [
-            {"path": "one.jsonl", "thread_ids": ["codex-a"], "direct_tokens": 50, "total_tokens": 200},
-            {"path": "two.jsonl", "thread_ids": [], "direct_tokens": 10, "total_tokens": 30},
+            {"path": "one.jsonl", "direct_tokens": 50, "total_tokens": 200},
+            {"path": "two.jsonl", "direct_tokens": 10, "total_tokens": 30},
         ]
 
-        report = savings.compute(codex, claude, ks=[0.5, 1.0, 2.0], strict=False)
+        report = savings.compute(codex, claude, ks=[0.5, 1.0, 2.0])
 
         self.assertEqual(report["attribution"], "broad[source:mcp]")
         self.assertEqual(report["codex_session_count"], 2)
@@ -994,28 +860,6 @@ class ComputeTests(SavingsTestCase):
             {"k": 1.0, "avoided_tokens": 400, "net_savings_tokens": 340},
             {"k": 2.0, "avoided_tokens": 800, "net_savings_tokens": 740},
         ])
-
-    def test_compute_strict_uses_only_linked_codex_sessions_and_matching_overhead(self):
-        codex = [
-            {"id": "codex-a", "cwd": "/repo/a", "codex_tokens": 100, "ts_utc": savings._parse_utc("2026-06-03T00:00:00Z")},
-            {"id": "codex-b", "cwd": "/repo/b", "codex_tokens": 300, "ts_utc": savings._parse_utc("2026-06-03T01:00:00Z")},
-        ]
-        claude = [
-            {"path": "one.jsonl", "thread_ids": ["codex-a"], "direct_tokens": 50, "total_tokens": 200},
-            {"path": "two.jsonl", "thread_ids": ["missing"], "direct_tokens": 10, "total_tokens": 30},
-        ]
-
-        report = savings.compute(codex, claude, ks=[1.0], strict=True)
-
-        self.assertEqual(report["attribution"], "strict[threadId=id]")
-        self.assertEqual(report["codex_session_count"], 1)
-        self.assertEqual(report["codex_tokens"], 100)
-        self.assertEqual(report["claude_direct_tokens"], 50)
-        self.assertEqual(report["claude_total_tokens"], 200)
-        self.assertEqual(report["linked_pairs"][0]["thread_id"], "codex-a")
-        self.assertEqual(report["sensitivity"], [
-            {"k": 1.0, "avoided_tokens": 100, "net_savings_tokens": 50},
-        ])
 ```
 
 - [ ] **Step 2: Run test to verify it fails**
@@ -1026,7 +870,7 @@ Expected output:
 
 ```text
 AttributeError: module 'scripts.savings' has no attribute 'compute'
-FAILED (errors=2)
+FAILED (errors=1)
 ```
 
 - [ ] **Step 3: Write minimal implementation**
@@ -1052,30 +896,14 @@ def _unique_by_id(sessions: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 
 def compute(
-    codex: list[dict[str, Any]],
-    claude: list[dict[str, Any]],
+    codex_sessions: list[dict[str, Any]],
+    claude_overhead: list[dict[str, Any]],
     ks: list[float] | tuple[float, ...] = DEFAULT_KS,
-    strict: bool = False,
 ) -> dict[str, Any]:
-    linked_pairs = link(codex, claude)
-
-    if strict:
-        linked_ids = {pair["thread_id"] for pair in linked_pairs}
-        selected_codex = [session for session in codex if session.get("id") in linked_ids]
-        selected_claude = [
-            overhead for overhead in claude
-            if linked_ids.intersection(overhead.get("thread_ids", []))
-        ]
-        attribution = "strict[threadId=id]"
-    else:
-        selected_codex = codex
-        selected_claude = claude
-        attribution = "broad[source:mcp]"
-
-    unique_codex = _unique_by_id(selected_codex)
+    unique_codex = _unique_by_id(codex_sessions)
     codex_tokens = sum(session.get("codex_tokens", 0) for session in unique_codex)
-    claude_direct_tokens = sum(overhead.get("direct_tokens", 0) for overhead in selected_claude)
-    claude_total_tokens = sum(overhead.get("total_tokens", 0) for overhead in selected_claude)
+    claude_direct_tokens = sum(overhead.get("direct_tokens", 0) for overhead in claude_overhead)
+    claude_total_tokens = sum(overhead.get("total_tokens", 0) for overhead in claude_overhead)
 
     sensitivity = []
     for k_value in ks:
@@ -1087,13 +915,13 @@ def compute(
         })
 
     return {
-        "attribution": attribution,
+        "attribution": "broad[source:mcp]",
         "codex_session_count": len(unique_codex),
         "codex_tokens": codex_tokens,
         "claude_direct_tokens": claude_direct_tokens,
         "claude_total_tokens": claude_total_tokens,
         "sensitivity": sensitivity,
-        "linked_pairs": linked_pairs,
+        "codex_sessions": unique_codex,
         "projects": sorted({session.get("cwd", "") for session in unique_codex if session.get("cwd")}),
     }
 ```
@@ -1106,7 +934,6 @@ Expected output:
 
 ```text
 test_compute_broad_uses_all_codex_sessions_and_direct_overhead ... ok
-test_compute_strict_uses_only_linked_codex_sessions_and_matching_overhead ... ok
 
 OK
 ```
@@ -1118,7 +945,7 @@ git add scripts/savings.py tests/test_savings.py
 git commit -m "feat: compute counterfactual savings"
 ```
 
-## Task 7: `render`
+## Task 6: `render`
 
 **Files:**
 - Modify: `scripts/savings.py`
@@ -1131,7 +958,7 @@ Append to `tests/test_savings.py`:
 
 ```python
 class RenderTests(SavingsTestCase):
-    def test_render_outputs_headline_sensitivity_and_linked_breakdown(self):
+    def test_render_outputs_headline_sensitivity_and_codex_session_breakdown(self):
         report = {
             "attribution": "broad[source:mcp]",
             "codex_session_count": 1,
@@ -1143,15 +970,14 @@ class RenderTests(SavingsTestCase):
                 {"k": 0.5, "avoided_tokens": 620000, "net_savings_tokens": 582000},
                 {"k": 1.0, "avoided_tokens": 1240000, "net_savings_tokens": 1202000},
             ],
-            "linked_pairs": [{
-                "thread_id": "codex-a",
-                "codex": {
+            "codex_sessions": [
+                {
+                    "id": "codex-a",
                     "cwd": "/repo/daily-news",
                     "ts_utc": savings._parse_utc("2026-06-03T07:29:00Z"),
                     "codex_tokens": 61285,
                 },
-                "claude": {"direct_tokens": 5400},
-            }],
+            ],
         }
 
         text = savings.render(report, since_utc=savings._parse_utc("2026-06-02T00:00:00Z"))
@@ -1165,7 +991,8 @@ class RenderTests(SavingsTestCase):
         self.assertIn("k=1.0  -> 1,202,000 tok", text)
         self.assertIn("下限保証ではない", text)
         self.assertIn("残存ログのみが対象", text)
-        self.assertIn("2026-06-03T07:29:00Z  /repo/daily-news  Codex 61,285  Claude(direct) 5,400", text)
+        self.assertIn("Codex セッション一覧（日付UTC / cwd / Codex トークン）:", text)
+        self.assertIn("2026-06-03T07:29:00Z  /repo/daily-news  Codex 61,285", text)
 ```
 
 - [ ] **Step 2: Run test to verify it fails**
@@ -1217,21 +1044,18 @@ def render(report: dict[str, Any], since_utc: datetime | None = None) -> str:
         "注: k は Claude/Codex 間の tokenizer・モデル挙動・cache 条件・委譲運用差を含む未校正係数。下限保証ではない。",
         "注: ログのローテーションや削除がある場合、残存ログのみが対象。",
         "",
-        "セッション別内訳（threadId リンク, 取れた分）:",
+        "Codex セッション一覧（日付UTC / cwd / Codex トークン）:",
     ])
 
-    linked_pairs = report.get("linked_pairs", [])
-    if linked_pairs:
-        for pair in linked_pairs:
-            codex = pair["codex"]
-            claude = pair["claude"]
+    codex_sessions = report.get("codex_sessions", [])
+    if codex_sessions:
+        for codex in codex_sessions:
             lines.append(
                 f"  {_format_utc(codex.get('ts_utc'))}  {codex.get('cwd', '')}  "
-                f"Codex {_format_int(codex.get('codex_tokens', 0))}  "
-                f"Claude(direct) {_format_int(claude.get('direct_tokens', 0))}"
+                f"Codex {_format_int(codex.get('codex_tokens', 0))}"
             )
     else:
-        lines.append("  linked sessions: 0")
+        lines.append("  Codex sessions: 0")
 
     return "\n".join(lines) + "\n"
 ```
@@ -1243,7 +1067,7 @@ Run: `python3 -m unittest tests.test_savings.RenderTests -v`
 Expected output:
 
 ```text
-test_render_outputs_headline_sensitivity_and_linked_breakdown ... ok
+test_render_outputs_headline_sensitivity_and_codex_session_breakdown ... ok
 
 OK
 ```
@@ -1255,7 +1079,7 @@ git add scripts/savings.py tests/test_savings.py
 git commit -m "feat: render savings report"
 ```
 
-## Task 8: `main`
+## Task 7: `main`
 
 **Files:**
 - Modify: `scripts/savings.py`
@@ -1279,19 +1103,19 @@ class MainTests(SavingsTestCase):
             {"type": "turn", "payload": {"last_token_usage": {"total_tokens": tokens}}},
         ])
 
-    def write_claude_transcript(self, root, thread_id, direct_tokens):
+    def write_claude_transcript(self, root, direct_tokens):
         self.write_jsonl(Path(root) / "claude" / "projects" / "repo" / "session.jsonl", [
             {"type": "assistant", "timestamp": "2026-06-03T00:00:00Z", "message": {
                 "id": "msg-1",
                 "usage": {"input_tokens": direct_tokens, "output_tokens": 0},
-                "content": [{"type": "tool_use", "name": "mcp__codex__codex-reply", "input": {"threadId": thread_id, "prompt": "continue"}}],
+                "content": [{"type": "tool_use", "name": "mcp__codex__codex-reply", "input": {"prompt": "continue"}}],
             }},
         ])
 
     def test_main_runs_broad_report_with_custom_roots(self):
         with tempfile.TemporaryDirectory() as tmp:
             self.write_codex_session(tmp, "codex-a", "mcp", "/repo/project", "2026-06-03T00:00:00Z", 100)
-            self.write_claude_transcript(tmp, "codex-a", 25)
+            self.write_claude_transcript(tmp, 25)
 
             exit_code = savings.main([
                 "--codex-root", str(Path(tmp) / "codex"),
@@ -1350,7 +1174,6 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--since", help="UTC date or datetime, for example 2026-06-01 or 2026-06-01T00:00:00Z")
     parser.add_argument("--cwd", dest="cwd_filter", help="Project cwd substring filter")
     parser.add_argument("--cwd-exact", action="store_true", help="Treat --cwd as a normalized exact path")
-    parser.add_argument("--strict", action="store_true", help="Require Claude threadId to match Codex session id")
     parser.add_argument("--k", type=float, action="append", dest="ks", help="Counterfactual multiplier; may be repeated")
     parser.add_argument("--no-cache", action="store_true", help="Exclude Claude cache creation/read tokens from overhead")
     parser.add_argument("--include-sidechains", action="store_true", help="Include Claude sidechain transcripts")
@@ -1383,7 +1206,6 @@ def main(argv: list[str] | None = None) -> int:
         codex_sessions,
         claude_overhead,
         ks=args.ks if args.ks else DEFAULT_KS,
-        strict=args.strict,
     )
     sys.stdout.write(render(report, since_utc=since_utc))
     return 0
@@ -1423,7 +1245,7 @@ git add scripts/savings.py tests/test_savings.py
 git commit -m "feat: add savings report cli"
 ```
 
-## Task 9: README / SKILL Quick Reference
+## Task 8: README / SKILL Quick Reference
 
 **Files:**
 - Modify: `README.md`
@@ -1437,7 +1259,7 @@ Insert the following section in `README.md` after the existing `## 使い方` se
 ```markdown
 ## 節約量の計測
 
-`python3 scripts/savings.py` で残存ログ全期間を broad attribution（`source:"mcp"`）で集計し、`--since 2026-06-01` は UTC 基準の期間フィルタ、`--strict` は Claude `threadId` と Codex session `id` が一致した委譲だけに絞り込む。
+`python3 scripts/savings.py` で残存ログ全期間を broad attribution（`source:"mcp"`）で集計する。この環境では MCP-Codex セッションが本スキルの委譲のみであることを実測確認済みで、`--since 2026-06-01` は UTC 基準の期間フィルタとして扱う。
 プロジェクトは `--cwd daily-news`（部分一致）または `--cwd-exact /path/to/project`（正規化パス完全一致）で絞り込む。
 出力は `k=0.5/1.0/1.5/2.0` の感度表を含み、純節約は「推定 Claude 回避量 − Claude overhead（狭義 direct）」として表示する。
 `k` は tokenizer・モデル挙動・cache 条件・委譲運用差を含む未校正係数で、下限保証ではない。
@@ -1450,7 +1272,7 @@ Insert the following paragraph in `SKILL.md` immediately before `## クイック
 ```markdown
 ## 節約量の計測
 
-委譲による Claude Pro 枠の推定節約量は `python3 scripts/savings.py` で計測する。`--since` は UTC 基準、既定は broad attribution、`--strict` で `threadId` ↔ Codex session `id` の一致分だけに絞り込む。
+委譲による Claude Pro 枠の推定節約量は `python3 scripts/savings.py` で計測する。`--since` は UTC 基準で、attribution は実測確認済みの broad（`source:"mcp"`）一本にする。
 ```
 
 - [ ] **Step 3: Verify documentation consistency**
@@ -1462,7 +1284,7 @@ Check the updated text against these items:
 - README.md states that the report shows k sensitivity values.
 - README.md states that k is an uncalibrated coefficient and not a lower-bound guarantee.
 - README.md and SKILL.md state that --since is interpreted as UTC.
-- README.md and SKILL.md do not imply strict attribution is the default.
+- README.md and SKILL.md state that attribution is broad source:mcp because MCP-Codex sessions are confirmed to be this skill's delegations in this environment.
 ```
 
 - [ ] **Step 4: Commit**
@@ -1474,17 +1296,17 @@ git commit -m "docs: add savings calculator quick reference"
 
 ## Self-Review
 
-- Spec coverage: §6.1 Codex token logic is assigned to Task 1; §6.2 Claude overhead and cache behavior are assigned to Task 3; §6.3 attribution, UTC `--since`, `--cwd`, `--cwd-exact`, and `--strict` are assigned to Tasks 2, 5, 6, and 8; §6.4 counterfactual sensitivity is assigned to Task 6 and rendered in Task 7; §11 README/SKILL quick-reference documentation is assigned to Task 9.
-- Component coverage: §7 functions are covered by task components: `parse_codex_session` in Task 1, `iter_codex_sessions` and `collect_codex` in Task 2, `parse_claude_transcript` in Task 3, `collect_claude` in Task 4, `link` in Task 5, `compute` in Task 6, `render` in Task 7, and `main` in Task 8.
-- Edge-case coverage: §9 cases are covered by tests for non-monotonic cumulative usage, absent token data, absent or non-`mcp` source, split Claude messages, multiple Codex tool uses in one Claude message, `codex-reply` continuation by same thread id, sidechain exclusion and optional inclusion, string and nested `threadId` extraction, malformed JSONL skipping, UTC date filtering, and project filtering.
-- Test coverage: §10 items are allocated across Tasks 1 through 6, with CLI and rendering behavior covered in Tasks 7 and 8. Fixtures use temporary directories and inline JSONL rows, never real `~/.codex` or `~/.claude`.
+- Spec coverage: §6.1 Codex token logic is assigned to Task 1; §6.2 Claude overhead and cache behavior are assigned to Task 3; §6.3 attribution is broad (`source:"mcp"`) because this environment has verified that MCP-Codex sessions are only this skill's delegations, so strict matching is unnecessary; UTC `--since`, `--cwd`, and `--cwd-exact` are assigned to Tasks 2 and 7; §6.4 counterfactual sensitivity is assigned to Task 5 and rendered in Task 6; §11 README/SKILL quick-reference documentation is assigned to Task 8.
+- Component coverage: §7 functions are covered by task components: `parse_codex_session` in Task 1, `iter_codex_sessions` and `collect_codex` in Task 2, `parse_claude_transcript` in Task 3, `collect_claude` in Task 4, `compute` in Task 5, `render` in Task 6, and `main` in Task 7. The original `link` component is intentionally omitted as YAGNI for this verified environment.
+- Edge-case coverage: §9 cases are covered by tests for non-monotonic cumulative usage, absent token data, absent or non-`mcp` source, split Claude messages, multiple Codex tool uses in one Claude message, `codex-reply` overhead counting, sidechain exclusion and optional inclusion, malformed JSONL skipping, UTC date filtering, and project filtering.
+- Test coverage: §10 items are allocated across Tasks 1 through 5, with CLI, rendering, and documentation behavior covered in Tasks 6 through 8. Fixtures use temporary directories and inline JSONL rows, never real `~/.codex` or `~/.claude`.
 - Placeholder scan: The plan contains concrete paths, commands, expected outputs, and full code blocks for each test and implementation step. It does not rely on unspecified future work.
-- Type consistency: Later tasks use the same dict keys introduced earlier: `id`, `source`, `cwd`, `ts_utc`, `codex_tokens`, `thread_ids`, `direct_tokens`, `total_tokens`, `tool_use_count`, `linked_pairs`, and `sensitivity`.
-- Scope decision: Task 9 covers design spec §11 by adding README/SKILL quick-reference documentation without expanding the implementation beyond `scripts/savings.py` and `tests/test_savings.py`.
+- Type consistency: Later tasks use the same dict keys introduced earlier: `id`, `source`, `cwd`, `ts_utc`, `codex_tokens`, `direct_tokens`, `total_tokens`, `tool_use_count`, `codex_sessions`, and `sensitivity`.
+- Scope decision: Task 8 covers design spec §11 by adding README/SKILL quick-reference documentation without expanding the implementation beyond `scripts/savings.py` and `tests/test_savings.py`.
 
 ## Execution Handoff
 
-Two execution options:
+This plan contains 8 consecutive tasks. Two execution options:
 
 1. **Subagent-Driven (recommended)** - Use `superpowers:subagent-driven-development` and dispatch one fresh worker per task, reviewing each task before continuing.
 2. **Inline Execution** - Use `superpowers:executing-plans` and execute the tasks in this session with checkpoints between task batches.
