@@ -267,3 +267,51 @@ def collect_claude(
         records.extend(parse_claude_transcript(path, include_sidechains=include_sidechains, include_cache=include_cache))
 
     return records
+
+
+DEFAULT_KS = [0.5, 1.0, 1.5, 2.0]
+
+
+def _unique_by_id(sessions: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    seen: set[str] = set()
+    unique: list[dict[str, Any]] = []
+    for session in sessions:
+        session_id = session.get("id")
+        if not isinstance(session_id, str):
+            continue
+        if session_id in seen:
+            continue
+        seen.add(session_id)
+        unique.append(session)
+    return unique
+
+
+def compute(
+    codex_sessions: list[dict[str, Any]],
+    claude_overhead: list[dict[str, Any]],
+    ks: list[float] | tuple[float, ...] = DEFAULT_KS,
+) -> dict[str, Any]:
+    unique_codex = _unique_by_id(codex_sessions)
+    codex_tokens = sum(session.get("codex_tokens", 0) for session in unique_codex)
+    claude_direct_tokens = sum(overhead.get("direct_tokens", 0) for overhead in claude_overhead)
+    claude_total_tokens = sum(overhead.get("total_tokens", 0) for overhead in claude_overhead)
+
+    sensitivity = []
+    for k_value in ks:
+        avoided_tokens = int(round(codex_tokens * k_value))
+        sensitivity.append({
+            "k": float(k_value),
+            "avoided_tokens": avoided_tokens,
+            "net_savings_tokens": avoided_tokens - claude_direct_tokens,
+        })
+
+    return {
+        "attribution": "broad[source:mcp]",
+        "codex_session_count": len(unique_codex),
+        "codex_tokens": codex_tokens,
+        "claude_direct_tokens": claude_direct_tokens,
+        "claude_total_tokens": claude_total_tokens,
+        "sensitivity": sensitivity,
+        "codex_sessions": unique_codex,
+        "projects": sorted({session.get("cwd", "") for session in unique_codex if session.get("cwd")}),
+    }

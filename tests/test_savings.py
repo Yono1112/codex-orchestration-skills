@@ -332,3 +332,28 @@ class CollectClaudeTests(SavingsTestCase):
 
             self.assertEqual([Path(record["path"]).name for record in default_records], ["main.jsonl"])
             self.assertEqual([Path(record["path"]).name for record in included_records], ["main.jsonl", "side.jsonl"])
+
+
+class ComputeTests(SavingsTestCase):
+    def test_compute_broad_uses_all_codex_sessions_and_direct_overhead(self):
+        codex = [
+            {"id": "codex-a", "cwd": "/repo/a", "codex_tokens": 100, "ts_utc": savings._parse_utc("2026-06-03T00:00:00Z")},
+            {"id": "codex-b", "cwd": "/repo/b", "codex_tokens": 300, "ts_utc": savings._parse_utc("2026-06-03T01:00:00Z")},
+        ]
+        claude = [
+            {"path": "one.jsonl", "direct_tokens": 50, "total_tokens": 200},
+            {"path": "two.jsonl", "direct_tokens": 10, "total_tokens": 30},
+        ]
+
+        report = savings.compute(codex, claude, ks=[0.5, 1.0, 2.0])
+
+        self.assertEqual(report["attribution"], "broad[source:mcp]")
+        self.assertEqual(report["codex_session_count"], 2)
+        self.assertEqual(report["codex_tokens"], 400)
+        self.assertEqual(report["claude_direct_tokens"], 60)
+        self.assertEqual(report["claude_total_tokens"], 230)
+        self.assertEqual(report["sensitivity"], [
+            {"k": 0.5, "avoided_tokens": 200, "net_savings_tokens": 140},
+            {"k": 1.0, "avoided_tokens": 400, "net_savings_tokens": 340},
+            {"k": 2.0, "avoided_tokens": 800, "net_savings_tokens": 740},
+        ])
