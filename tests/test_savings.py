@@ -395,3 +395,45 @@ class RenderTests(SavingsTestCase):
         self.assertIn("残存ログのみが対象", text)
         self.assertIn("Codex セッション一覧（日付UTC / cwd / Codex トークン）:", text)
         self.assertIn("2026-06-03T07:29:00Z  /repo/daily-news  Codex 61,285", text)
+
+
+class MainTests(SavingsTestCase):
+    def write_codex_session(self, root, session_id, source, cwd, timestamp, tokens):
+        self.write_jsonl(Path(root) / "codex" / "sessions" / "2026" / "06" / "03" / f"rollout-{session_id}.jsonl", [
+            {"type": "session_meta", "payload": {
+                "id": session_id,
+                "source": source,
+                "cwd": cwd,
+                "timestamp": timestamp,
+            }},
+            {"type": "turn", "payload": {"last_token_usage": {"total_tokens": tokens}}},
+        ])
+
+    def write_claude_transcript(self, root, direct_tokens):
+        self.write_jsonl(Path(root) / "claude" / "projects" / "repo" / "session.jsonl", [
+            {"type": "assistant", "timestamp": "2026-06-03T00:00:00Z", "message": {
+                "id": "msg-1",
+                "usage": {"input_tokens": direct_tokens, "output_tokens": 0},
+                "content": [{"type": "tool_use", "name": "mcp__codex__codex-reply", "input": {"prompt": "continue"}}],
+            }},
+        ])
+
+    def test_main_runs_broad_report_with_custom_roots(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self.write_codex_session(tmp, "codex-a", "mcp", "/repo/project", "2026-06-03T00:00:00Z", 100)
+            self.write_claude_transcript(tmp, 25)
+
+            exit_code = savings.main([
+                "--codex-root", str(Path(tmp) / "codex"),
+                "--claude-root", str(Path(tmp) / "claude"),
+                "--since", "2026-06-02",
+                "--cwd", "project",
+                "--k", "1.0",
+            ])
+
+            self.assertEqual(exit_code, 0)
+
+    def test_main_rejects_invalid_since_date(self):
+        exit_code = savings.main(["--since", "not-a-date"])
+
+        self.assertEqual(exit_code, 2)

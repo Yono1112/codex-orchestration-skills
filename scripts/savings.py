@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import argparse
 import json
+import sys
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -364,3 +366,62 @@ def render(report: dict[str, Any], since_utc: datetime | None = None) -> str:
         lines.append("  Codex sessions: 0")
 
     return "\n".join(lines) + "\n"
+
+
+def _parse_since_arg(value: str | None) -> datetime | None:
+    if value is None:
+        return None
+    try:
+        if len(value) == 10:
+            return _parse_utc(value + "T00:00:00Z")
+        return _parse_utc(value)
+    except ValueError:
+        return None
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Estimate Claude token savings from Codex delegation logs.")
+    parser.add_argument("--codex-root", default=str(Path.home() / ".codex"), help="Codex log root; defaults to ~/.codex")
+    parser.add_argument("--claude-root", default=str(Path.home() / ".claude"), help="Claude log root; defaults to ~/.claude")
+    parser.add_argument("--since", help="UTC date or datetime, for example 2026-06-01 or 2026-06-01T00:00:00Z")
+    parser.add_argument("--cwd", dest="cwd_filter", help="Project cwd substring filter")
+    parser.add_argument("--cwd-exact", action="store_true", help="Treat --cwd as a normalized exact path")
+    parser.add_argument("--k", type=float, action="append", dest="ks", help="Counterfactual multiplier; may be repeated")
+    parser.add_argument("--no-cache", action="store_true", help="Exclude Claude cache creation/read tokens from overhead")
+    parser.add_argument("--include-sidechains", action="store_true", help="Include Claude sidechain transcripts")
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+
+    since_utc = _parse_since_arg(args.since)
+    if args.since and since_utc is None:
+        parser.print_usage(sys.stderr)
+        sys.stderr.write("savings.py: error: --since must be a UTC date or ISO datetime\n")
+        return 2
+
+    codex_sessions = collect_codex(
+        args.codex_root,
+        since_utc=since_utc,
+        cwd_filter=args.cwd_filter,
+        cwd_exact=args.cwd_exact,
+    )
+    claude_overhead = collect_claude(
+        args.claude_root,
+        since_utc=since_utc,
+        include_sidechains=args.include_sidechains,
+        include_cache=not args.no_cache,
+    )
+    report = compute(
+        codex_sessions,
+        claude_overhead,
+        ks=args.ks if args.ks else DEFAULT_KS,
+    )
+    sys.stdout.write(render(report, since_utc=since_utc))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
