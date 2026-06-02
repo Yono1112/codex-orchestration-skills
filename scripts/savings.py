@@ -78,3 +78,46 @@ def parse_codex_session(path: str | Path) -> dict[str, Any] | None:
         "codex_tokens": codex_tokens,
         "path": str(Path(path)),
     }
+
+
+def iter_codex_sessions(root: str | Path):
+    root_path = Path(root)
+    if not root_path.exists():
+        return
+    yield from sorted(root_path.rglob("rollout-*.jsonl"))
+
+
+def _normalized_path_text(value: str | None) -> str:
+    if not value:
+        return ""
+    return str(Path(value).expanduser())
+
+
+def collect_codex(
+    root: str | Path,
+    since_utc: datetime | None = None,
+    cwd_filter: str | None = None,
+    cwd_exact: bool = False,
+) -> list[dict[str, Any]]:
+    sessions: list[dict[str, Any]] = []
+    normalized_filter = _normalized_path_text(cwd_filter) if cwd_filter and cwd_exact else cwd_filter
+
+    for path in iter_codex_sessions(root):
+        session = parse_codex_session(path)
+        if session is None:
+            continue
+        if session.get("source") != "mcp":
+            continue
+        ts_utc = session.get("ts_utc")
+        if since_utc is not None and (ts_utc is None or ts_utc < since_utc):
+            continue
+        cwd = session.get("cwd") or ""
+        if normalized_filter:
+            if cwd_exact:
+                if _normalized_path_text(cwd) != normalized_filter:
+                    continue
+            elif normalized_filter not in cwd:
+                continue
+        sessions.append(session)
+
+    return sessions
