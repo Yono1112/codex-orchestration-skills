@@ -18,6 +18,56 @@ class SavingsTestCase(unittest.TestCase):
 
 
 class ParseCodexSessionTests(SavingsTestCase):
+    def test_sums_info_last_token_usage_from_event_messages(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "rollout-info-last-usage.jsonl"
+            self.write_jsonl(path, [
+                {"type": "session_meta", "payload": {
+                    "id": "codex-info-a",
+                    "source": "mcp",
+                    "cwd": "/repo/project",
+                    "timestamp": "2026-06-03T00:00:00Z",
+                }},
+                {"type": "event_msg", "payload": {"info": {
+                    "last_token_usage": {"total_tokens": 18140},
+                    "total_token_usage": {"total_tokens": 36193},
+                    "model_context_window": 258400,
+                }}},
+                {"type": "event_msg", "payload": {"info": {
+                    "last_token_usage": {"total_tokens": 2220},
+                    "total_token_usage": {"total_tokens": 38413},
+                    "model_context_window": 258400,
+                }}},
+            ])
+
+            session = savings.parse_codex_session(path)
+
+            self.assertEqual(session["codex_tokens"], 20360)
+
+    def test_falls_back_to_info_total_token_usage_when_last_usage_missing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "rollout-info-fallback.jsonl"
+            self.write_jsonl(path, [
+                {"type": "session_meta", "payload": {
+                    "id": "codex-info-b",
+                    "source": "mcp",
+                    "cwd": "/repo/project",
+                    "timestamp": "2026-06-03T01:00:00Z",
+                }},
+                {"type": "event_msg", "payload": {"info": {
+                    "total_token_usage": {"total_tokens": 300},
+                    "model_context_window": 258400,
+                }}},
+                {"type": "event_msg", "payload": {"info": {
+                    "total_token_usage": {"total_tokens": 450},
+                    "model_context_window": 258400,
+                }}},
+            ])
+
+            session = savings.parse_codex_session(path)
+
+            self.assertEqual(session["codex_tokens"], 450)
+
     def test_sums_last_token_usage_even_when_cumulative_is_non_monotonic(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "rollout-2026-06-03T000000Z.jsonl"
@@ -222,13 +272,24 @@ class ParseClaudeTranscriptTests(SavingsTestCase):
             self.assertEqual(records[0]["direct_tokens"], 120)
             self.assertEqual(records[0]["tool_use_count"], 2)
 
-    def test_counts_next_assistant_after_codex_tool_result_as_direct_overhead(self):
+    def test_counts_next_assistant_after_matching_codex_tool_result_as_direct_overhead(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "project" / "session.jsonl"
             self.write_jsonl(path, [
+                {"type": "assistant", "message": {
+                    "id": "msg-delegate",
+                    "usage": self.usage(20, 0, 0, 5),
+                    "content": [{
+                        "type": "tool_use",
+                        "name": "mcp__codex__codex",
+                        "id": "toolu_A",
+                        "input": {"prompt": "work"},
+                    }],
+                }},
                 {"type": "user", "message": {"content": [{
                     "type": "tool_result",
-                    "content": "codex completed",
+                    "tool_use_id": "toolu_A",
+                    "content": "completed",
                 }]}},
                 {"type": "assistant", "requestId": "request-1", "message": {
                     "usage": self.usage(30, 1, 1, 8),
@@ -238,8 +299,50 @@ class ParseClaudeTranscriptTests(SavingsTestCase):
 
             records = savings.parse_claude_transcript(path)
 
-            self.assertEqual(records[0]["direct_tokens"], 40)
-            self.assertEqual(records[0]["total_tokens"], 40)
+            self.assertEqual(records[0]["direct_tokens"], 65)
+            self.assertEqual(records[0]["total_tokens"], 65)
+
+    def test_tool_result_content_with_codex_text_does_not_mark_next_assistant_direct(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "project" / "session.jsonl"
+            self.write_jsonl(path, [
+                {"type": "assistant", "message": {
+                    "id": "msg-delegate",
+                    "usage": self.usage(100, 0, 0, 20),
+                    "content": [{
+                        "type": "tool_use",
+                        "name": "mcp__codex__codex",
+                        "id": "toolu_A",
+                        "input": {"prompt": "work"},
+                    }],
+                }},
+                {"type": "user", "message": {"content": [{
+                    "type": "tool_result",
+                    "tool_use_id": "toolu_A",
+                    "content": [{"type": "text", "text": "completed"}],
+                }]}},
+                {"type": "assistant", "message": {
+                    "id": "msg-review",
+                    "usage": self.usage(30, 1, 1, 8),
+                    "content": [{"type": "text", "text": "review result"}],
+                }},
+                {"type": "user", "message": {"content": [{
+                    "type": "tool_result",
+                    "tool_use_id": "toolu_OTHER",
+                    "content": [{"type": "text", "text": "README mentions codex-orchestration"}],
+                }]}},
+                {"type": "assistant", "message": {
+                    "id": "msg-after-read",
+                    "usage": self.usage(20, 0, 0, 5),
+                    "content": [{"type": "text", "text": "ordinary follow-up"}],
+                }},
+            ])
+
+            records = savings.parse_claude_transcript(path)
+
+            self.assertEqual(records[0]["direct_tokens"], 160)
+            self.assertEqual(records[0]["total_tokens"], 185)
+            self.assertEqual(records[0]["tool_use_count"], 1)
 
     def test_ignores_non_codex_messages_for_direct_overhead_but_keeps_session_total_when_delegation_exists(self):
         with tempfile.TemporaryDirectory() as tmp:
