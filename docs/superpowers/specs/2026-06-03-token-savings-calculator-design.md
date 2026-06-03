@@ -36,8 +36,10 @@
   - `cwd`: 作業ディレクトリ（プロジェクト絞り込み用）。
   - `id`: セッション ID（`codex-reply` 継続の名寄せに使用）。
   - `timestamp`: 開始時刻。
-- 各ターンに token 情報（`input_tokens` / `output_tokens` / `total_tokens`）。
-  - **重要**: これらは**累積値**（ターンが進むと `input_tokens` が膨らむ）。単純合算は二重計上になる。
+- token 情報は `type:"event_msg"` 行の **`payload.info`** の下にある（`payload` 直下ではない点に注意）:
+  - `payload.info.total_token_usage.total_tokens` … **累積値**（ターン進行で増える）。
+  - `payload.info.last_token_usage.total_tokens` … **そのターン単体**。
+  - 実装は `payload.info` を優先解決し、無い場合のみ `payload` 直下に fallback する（後方互換）。
 
 ### 3.2 Claude 側 — 委譲の「オーバーヘッド」
 - 場所: `~/.claude/projects/<encoded-cwd>/<session-uuid>.jsonl`（JSONL）。
