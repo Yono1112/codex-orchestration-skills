@@ -33,6 +33,7 @@ ln -s "$(pwd)" ~/.claude/skills/codex-orchestration
 `python3 scripts/savings.py` で残存ログ全期間を broad attribution（`source:"mcp"`）で集計する。この環境では MCP-Codex セッションが本スキルの委譲のみであることを実測確認済みで、`--since 2026-06-01` は UTC 基準の期間フィルタとして扱う。
 プロジェクトは `--cwd daily-news`（部分一致）または `--cwd-exact /path/to/project`（正規化パス完全一致）で絞り込む。
 出力は `k=0.5/1.0/1.5/2.0` の感度表を含み、純節約は「推定 Claude 回避量 − Claude overhead（狭義 direct）」として表示する。
+token 表示に加えて概算 USD も併記する。overhead は実 transcript の model 別 4 種別課金、回避分は `--counterfactual-model`（既定 `claude-opus-4-5`）の input レートによる反実仮想。
 `k` は tokenizer・モデル挙動・cache 条件・委譲運用差を含む未校正係数で、下限保証ではない。
 
 ## 編集・更新

@@ -137,6 +137,39 @@ CODEX_TOOL_NAMES = {
     "codex-reply",
 }
 
+# Source: https://platform.claude.com/docs/about-claude/pricing
+# Retrieved: 2026-06-03. Rates are USD per 1M tokens.
+DEFAULT_PRICING: dict[str, dict[str, float]] = {
+    "claude-opus-4-8": {"input": 5.0, "cache_write": 6.25, "cache_read": 0.50, "output": 25.0},
+    "claude-opus-4-7": {"input": 5.0, "cache_write": 6.25, "cache_read": 0.50, "output": 25.0},
+    "claude-opus-4-6": {"input": 5.0, "cache_write": 6.25, "cache_read": 0.50, "output": 25.0},
+    "claude-opus-4-5": {"input": 5.0, "cache_write": 6.25, "cache_read": 0.50, "output": 25.0},
+    "claude-opus-4-1": {"input": 15.0, "cache_write": 18.75, "cache_read": 1.50, "output": 75.0},
+    "claude-opus-4": {"input": 15.0, "cache_write": 18.75, "cache_read": 1.50, "output": 75.0},
+    "claude-sonnet-4-6": {"input": 3.0, "cache_write": 3.75, "cache_read": 0.30, "output": 15.0},
+    "claude-sonnet-4-5": {"input": 3.0, "cache_write": 3.75, "cache_read": 0.30, "output": 15.0},
+    "claude-sonnet-4": {"input": 3.0, "cache_write": 3.75, "cache_read": 0.30, "output": 15.0},
+    "claude-haiku-4-5": {"input": 1.0, "cache_write": 1.25, "cache_read": 0.10, "output": 5.0},
+    "claude-3-5-haiku": {"input": 0.80, "cache_write": 1.00, "cache_read": 0.08, "output": 4.0},
+}
+
+MODEL_MATCH_ORDER = [
+    "claude-opus-4-8",
+    "claude-opus-4-7",
+    "claude-opus-4-6",
+    "claude-opus-4-5",
+    "claude-opus-4-1",
+    "claude-opus-4",
+    "claude-sonnet-4-6",
+    "claude-sonnet-4-5",
+    "claude-sonnet-4",
+    "claude-haiku-4-5",
+    "claude-3-5-haiku",
+]
+
+FALLBACK_MODEL = "claude-sonnet-4-5"
+DEFAULT_COUNTERFACTUAL_MODEL = "claude-opus-4-5"
+
 
 def _message_from_row(row: dict[str, Any]) -> dict[str, Any]:
     message = row.get("message")
@@ -154,12 +187,109 @@ def _message_key(row: dict[str, Any], message: dict[str, Any], index: int) -> st
 
 
 def _usage_tokens(usage: dict[str, Any] | None, include_cache: bool) -> int:
+    return sum(_usage_breakdown(usage, include_cache).values())
+
+
+def _usage_breakdown(usage: dict[str, Any] | None, include_cache: bool) -> dict[str, int]:
     if not isinstance(usage, dict):
-        return 0
-    keys = ["input_tokens", "output_tokens"]
-    if include_cache:
-        keys.extend(["cache_creation_input_tokens", "cache_read_input_tokens"])
-    return sum(value for key in keys if isinstance((value := usage.get(key)), int))
+        return {"input": 0, "output": 0, "cache_creation": 0, "cache_read": 0}
+
+    breakdown = {
+        "input": usage.get("input_tokens") if isinstance(usage.get("input_tokens"), int) else 0,
+        "output": usage.get("output_tokens") if isinstance(usage.get("output_tokens"), int) else 0,
+        "cache_creation": (
+            usage.get("cache_creation_input_tokens")
+            if include_cache and isinstance(usage.get("cache_creation_input_tokens"), int)
+            else 0
+        ),
+        "cache_read": (
+            usage.get("cache_read_input_tokens")
+            if include_cache and isinstance(usage.get("cache_read_input_tokens"), int)
+            else 0
+        ),
+    }
+    return breakdown
+
+
+def _add_usage(left: dict[str, int], right: dict[str, int]) -> dict[str, int]:
+    return {key: left.get(key, 0) + right.get(key, 0) for key in ("input", "output", "cache_creation", "cache_read")}
+
+
+def _resolve_model(model: Any, pricing: dict[str, dict[str, float]]) -> tuple[str, bool]:
+    model_text = model.lower() if isinstance(model, str) else ""
+    for key in MODEL_MATCH_ORDER:
+        if key in pricing and key in model_text:
+            return key, False
+    return FALLBACK_MODEL, True
+
+
+def _usage_usd(usage: dict[str, int], rates: dict[str, float]) -> float:
+    return (
+        usage["input"] * rates["input"]
+        + usage["output"] * rates["output"]
+        + usage["cache_creation"] * rates["cache_write"]
+        + usage["cache_read"] * rates["cache_read"]
+    ) / 1_000_000
+
+
+def _price_usage(
+    usage: dict[str, Any] | None,
+    model: Any,
+    include_cache: bool,
+    pricing: dict[str, dict[str, float]],
+) -> dict[str, Any]:
+    breakdown = _usage_breakdown(usage, include_cache)
+    resolved_model, used_fallback = _resolve_model(model, pricing)
+    rates = pricing[resolved_model]
+    return {
+        "usage": breakdown,
+        "tokens": sum(breakdown.values()),
+        "usd": _usage_usd(breakdown, rates),
+        "resolved_model": resolved_model,
+        "used_fallback": used_fallback,
+        "raw_model": model if isinstance(model, str) else "<missing>",
+    }
+
+
+def _normalize_rate_table(raw_rates: dict[str, Any]) -> dict[str, float] | None:
+    aliases = {
+        "input": "input",
+        "input_rate": "input",
+        "output": "output",
+        "output_rate": "output",
+        "cache_write": "cache_write",
+        "cache_creation": "cache_write",
+        "cache_creation_input": "cache_write",
+        "cache_read": "cache_read",
+        "cache_read_input": "cache_read",
+    }
+    normalized: dict[str, float] = {}
+    for raw_key, normalized_key in aliases.items():
+        value = raw_rates.get(raw_key)
+        if isinstance(value, (int, float)):
+            normalized[normalized_key] = float(value)
+    if {"input", "output", "cache_write", "cache_read"} <= set(normalized):
+        return normalized
+    return None
+
+
+def load_pricing(path: str | Path | None = None) -> dict[str, dict[str, float]]:
+    pricing = {model: rates.copy() for model, rates in DEFAULT_PRICING.items()}
+    if path is None:
+        return pricing
+
+    with Path(path).open("r", encoding="utf-8") as handle:
+        overrides = json.load(handle)
+    if not isinstance(overrides, dict):
+        raise ValueError("--pricing JSON must be an object keyed by model name")
+
+    for model, raw_rates in overrides.items():
+        if not isinstance(model, str) or not isinstance(raw_rates, dict):
+            continue
+        normalized = _normalize_rate_table(raw_rates)
+        if normalized is not None:
+            pricing[model] = normalized
+    return pricing
 
 
 def _content_items(message: dict[str, Any]) -> list[Any]:
@@ -196,7 +326,9 @@ def parse_claude_transcript(
     path: str | Path,
     include_sidechains: bool = False,
     include_cache: bool = True,
+    pricing: dict[str, dict[str, float]] | None = None,
 ) -> list[dict[str, Any]]:
+    pricing = pricing or load_pricing()
     unique_messages: list[dict[str, Any]] = []
     seen_message_keys: set[str] = set()
     codex_tool_use_ids: set[str] = set()
@@ -229,11 +361,16 @@ def parse_claude_transcript(
 
         is_direct = bool(codex_tool_items) or next_assistant_is_direct
         next_assistant_is_direct = False
+        priced_usage = _price_usage(message.get("usage"), message.get("model"), include_cache, pricing)
 
         unique_messages.append({
-            "tokens": _usage_tokens(message.get("usage"), include_cache),
+            "usage": priced_usage["usage"],
+            "tokens": priced_usage["tokens"],
+            "usd": priced_usage["usd"],
             "is_direct": is_direct,
             "tool_use_count": len(codex_tool_items),
+            "used_fallback": priced_usage["used_fallback"],
+            "raw_model": priced_usage["raw_model"],
         })
 
     direct_tokens = sum(message["tokens"] for message in unique_messages if message["is_direct"])
@@ -241,12 +378,32 @@ def parse_claude_transcript(
     if direct_tokens == 0 and tool_use_count == 0:
         return []
 
+    direct_messages = [message for message in unique_messages if message["is_direct"]]
+    unpriced_fallback_models = sorted({
+        message["raw_model"]
+        for message in direct_messages
+        if message["used_fallback"]
+    })
+
     return [{
         "path": str(Path(path)),
         "direct_tokens": direct_tokens,
+        "direct_usage": _sum_usage(message["usage"] for message in direct_messages),
+        "direct_usd": sum(message["usd"] for message in direct_messages),
         "total_tokens": sum(message["tokens"] for message in unique_messages),
+        "total_usage": _sum_usage(message["usage"] for message in unique_messages),
+        "total_usd": sum(message["usd"] for message in unique_messages),
         "tool_use_count": tool_use_count,
+        "unpriced_fallback_tokens": sum(message["tokens"] for message in direct_messages if message["used_fallback"]),
+        "unpriced_fallback_models": unpriced_fallback_models,
     }]
+
+
+def _sum_usage(items) -> dict[str, int]:
+    total = {"input": 0, "output": 0, "cache_creation": 0, "cache_read": 0}
+    for item in items:
+        total = _add_usage(total, item)
+    return total
 
 
 def _first_timestamp(path: Path) -> datetime | None:
@@ -265,17 +422,24 @@ def collect_claude(
     since_utc: datetime | None = None,
     include_sidechains: bool = False,
     include_cache: bool = True,
+    pricing: dict[str, dict[str, float]] | None = None,
 ) -> list[dict[str, Any]]:
     root_path = Path(root)
     if not root_path.exists():
         return []
 
+    pricing = pricing or load_pricing()
     records: list[dict[str, Any]] = []
     for path in sorted(root_path.rglob("*.jsonl")):
         ts_utc = _first_timestamp(path)
         if since_utc is not None and (ts_utc is None or ts_utc < since_utc):
             continue
-        records.extend(parse_claude_transcript(path, include_sidechains=include_sidechains, include_cache=include_cache))
+        records.extend(parse_claude_transcript(
+            path,
+            include_sidechains=include_sidechains,
+            include_cache=include_cache,
+            pricing=pricing,
+        ))
 
     return records
 
@@ -301,35 +465,69 @@ def compute(
     codex_sessions: list[dict[str, Any]],
     claude_overhead: list[dict[str, Any]],
     ks: list[float] | tuple[float, ...] = DEFAULT_KS,
+    pricing: dict[str, dict[str, float]] | None = None,
+    counterfactual_model: str = DEFAULT_COUNTERFACTUAL_MODEL,
 ) -> dict[str, Any]:
+    pricing = pricing or load_pricing()
+    counterfactual_key = _resolve_counterfactual_model(counterfactual_model, pricing)
+    counterfactual_input_rate = pricing[counterfactual_key]["input"]
     unique_codex = _unique_by_id(codex_sessions)
     codex_tokens = sum(session.get("codex_tokens", 0) for session in unique_codex)
     claude_direct_tokens = sum(overhead.get("direct_tokens", 0) for overhead in claude_overhead)
     claude_total_tokens = sum(overhead.get("total_tokens", 0) for overhead in claude_overhead)
+    claude_direct_usd = sum(overhead.get("direct_usd", 0.0) for overhead in claude_overhead)
+    claude_total_usd = sum(overhead.get("total_usd", 0.0) for overhead in claude_overhead)
 
     sensitivity = []
     for k_value in ks:
         avoided_tokens = int(round(codex_tokens * k_value))
+        avoided_usd = avoided_tokens * counterfactual_input_rate / 1_000_000
         sensitivity.append({
             "k": float(k_value),
             "avoided_tokens": avoided_tokens,
             "net_savings_tokens": avoided_tokens - claude_direct_tokens,
+            "avoided_usd": avoided_usd,
+            "net_savings_usd": avoided_usd - claude_direct_usd,
         })
 
     return {
         "attribution": "broad[source:mcp]",
         "codex_session_count": len(unique_codex),
         "codex_tokens": codex_tokens,
+        "codex_counterfactual_usd": codex_tokens * counterfactual_input_rate / 1_000_000,
         "claude_direct_tokens": claude_direct_tokens,
+        "claude_direct_usd": claude_direct_usd,
         "claude_total_tokens": claude_total_tokens,
+        "claude_total_usd": claude_total_usd,
+        "counterfactual_model": counterfactual_key,
+        "counterfactual_input_rate": counterfactual_input_rate,
+        "unpriced_fallback_tokens": sum(overhead.get("unpriced_fallback_tokens", 0) for overhead in claude_overhead),
+        "unpriced_fallback_models": sorted({
+            model
+            for overhead in claude_overhead
+            for model in overhead.get("unpriced_fallback_models", [])
+        }),
         "sensitivity": sensitivity,
         "codex_sessions": unique_codex,
         "projects": sorted({session.get("cwd", "") for session in unique_codex if session.get("cwd")}),
     }
 
 
+def _resolve_counterfactual_model(model: str, pricing: dict[str, dict[str, float]]) -> str:
+    if model in pricing:
+        return model
+    resolved, used_fallback = _resolve_model(model, pricing)
+    return FALLBACK_MODEL if used_fallback else resolved
+
+
 def _format_int(value: int) -> str:
     return f"{value:,}"
+
+
+def _format_usd(value: float) -> str:
+    if value < 0:
+        return f"-${abs(value):,.2f}"
+    return f"${value:,.2f}"
 
 
 def _format_utc(dt: datetime | None) -> str:
@@ -347,29 +545,49 @@ def render(report: dict[str, Any], since_utc: datetime | None = None) -> str:
         f"codex-orchestration 節約レポート（UTC {since_text}, attribution={report['attribution']}）",
         f"委譲セッション数: {report['codex_session_count']}   対象プロジェクト: {project_text}",
         "─────────────────────────────────────────────",
-        f"Codex がやった仕事            : {_format_int(report['codex_tokens'])} tok",
-        f"Claude overhead (狭義 direct) : {_format_int(report['claude_direct_tokens'])} tok",
-        f"Claude 全処理トークン(参考)   : {_format_int(report['claude_total_tokens'])} tok",
+        f"Codex がやった仕事            : {_format_int(report['codex_tokens'])} tok   "
+        f"(≈ {_format_usd(report.get('codex_counterfactual_usd', 0.0))} 反実仮想 k=1.0)",
+        f"Claude overhead (狭義 direct) : {_format_int(report['claude_direct_tokens'])} tok   "
+        f"(≈ {_format_usd(report.get('claude_direct_usd', 0.0))} 実コスト概算)",
+        f"Claude 全処理トークン(参考)   : {_format_int(report['claude_total_tokens'])} tok   "
+        f"(≈ {_format_usd(report.get('claude_total_usd', 0.0))} 実コスト概算)",
         "─────────────────────────────────────────────",
         "純節約 sensitivity（仮定 k に基づく反実仮想）:",
     ]
 
     for row in report.get("sensitivity", []):
-        lines.append(f"  k={row['k']:.1f}  -> {_format_int(row['net_savings_tokens'])} tok")
+        lines.append(
+            f"  k={row['k']:.1f}  -> {_format_int(row['net_savings_tokens'])} tok   "
+            f"(≈ {_format_usd(row.get('net_savings_usd', 0.0))})"
+        )
 
     lines.extend([
         "注: k は Claude/Codex 間の tokenizer・モデル挙動・cache 条件・委譲運用差を含む未校正係数。下限保証ではない。",
+        f"注: 回避分USDは反実仮想 {report.get('counterfactual_model', DEFAULT_COUNTERFACTUAL_MODEL)} "
+        "入力レートのみの概算（出力があれば上振れ）。overhead USDは実transcriptのmodel別4種別課金。",
         "注: ログのローテーションや削除がある場合、残存ログのみが対象。",
+    ])
+    if report.get("unpriced_fallback_tokens", 0):
+        lines.append(
+            "注: unpriced(fallback) tokens: "
+            f"{_format_int(report.get('unpriced_fallback_tokens', 0))}, models: "
+            f"{', '.join(report.get('unpriced_fallback_models', []))}"
+        )
+
+    lines.extend([
         "",
         "Codex セッション一覧（日付UTC / cwd / Codex トークン）:",
     ])
 
     codex_sessions = report.get("codex_sessions", [])
+    counterfactual_rate = report.get("counterfactual_input_rate", DEFAULT_PRICING[DEFAULT_COUNTERFACTUAL_MODEL]["input"])
     if codex_sessions:
         for codex in codex_sessions:
+            session_tokens = codex.get("codex_tokens", 0)
+            session_usd = session_tokens * counterfactual_rate / 1_000_000
             lines.append(
                 f"  {_format_utc(codex.get('ts_utc'))}  {codex.get('cwd', '')}  "
-                f"Codex {_format_int(codex.get('codex_tokens', 0))}"
+                f"Codex {_format_int(session_tokens)} tok   (≈ {_format_usd(session_usd)} 反実仮想 k=1.0)"
             )
     else:
         lines.append("  Codex sessions: 0")
@@ -392,6 +610,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Estimate Claude token savings from Codex delegation logs.")
     parser.add_argument("--codex-root", default=str(Path.home() / ".codex"), help="Codex log root; defaults to ~/.codex")
     parser.add_argument("--claude-root", default=str(Path.home() / ".claude"), help="Claude log root; defaults to ~/.claude")
+    parser.add_argument("--pricing", help="JSON file with per-MTok USD pricing overrides, merged with the built-in table")
+    parser.add_argument(
+        "--counterfactual-model",
+        default=DEFAULT_COUNTERFACTUAL_MODEL,
+        help=f"Model key for avoided USD input-rate estimate; defaults to {DEFAULT_COUNTERFACTUAL_MODEL}",
+    )
     parser.add_argument("--since", help="UTC date or datetime, for example 2026-06-01 or 2026-06-01T00:00:00Z")
     parser.add_argument("--cwd", dest="cwd_filter", help="Project cwd substring filter")
     parser.add_argument("--cwd-exact", action="store_true", help="Treat --cwd as a normalized exact path")
@@ -410,6 +634,12 @@ def main(argv: list[str] | None = None) -> int:
         parser.print_usage(sys.stderr)
         sys.stderr.write("savings.py: error: --since must be a UTC date or ISO datetime\n")
         return 2
+    try:
+        pricing = load_pricing(args.pricing)
+    except (OSError, json.JSONDecodeError, ValueError) as exc:
+        parser.print_usage(sys.stderr)
+        sys.stderr.write(f"savings.py: error: --pricing {exc}\n")
+        return 2
 
     codex_sessions = collect_codex(
         args.codex_root,
@@ -422,11 +652,14 @@ def main(argv: list[str] | None = None) -> int:
         since_utc=since_utc,
         include_sidechains=args.include_sidechains,
         include_cache=not args.no_cache,
+        pricing=pricing,
     )
     report = compute(
         codex_sessions,
         claude_overhead,
         ks=args.ks if args.ks else DEFAULT_KS,
+        pricing=pricing,
+        counterfactual_model=args.counterfactual_model,
     )
     sys.stdout.write(render(report, since_utc=since_utc))
     return 0

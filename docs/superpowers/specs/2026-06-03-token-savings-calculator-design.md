@@ -20,12 +20,14 @@
 **スコープ**
 - 既存ログ（Codex セッション ＋ Claude transcript）からの集計。
 - 反実仮想推定（換算係数 `k` 付き）と純節約の算出。
+- 概算 USD の併記。トークン表示は維持し、USD は補助値として扱う。
 - 過去一括 ＋ 再実行による継続計測。
 
 **非スコープ（YAGNI）**
 - スキルのプロトコル改変（委譲時の台帳ロギング等）は行わない。`source:"mcp"` で attribution が解けるため不要。
 - ダッシュボード UI / 常駐デーモン。
-- 厳密な課金額（USD）換算。トークン数のみ扱う。
+- 厳密な請求額の再現。overhead は実 transcript の model 別 token から実コスト寄りに概算するが、
+  回避分は反実仮想なので仮定値として表示する。
 
 ## 3. データソース（実在を確認済み）
 
@@ -96,6 +98,9 @@
   純節約の既定計算には **狭義 direct overhead** を用い、全処理トークンは参考表示。
 - トークン数え方 = `input_tokens + cache_creation_input_tokens + cache_read_input_tokens + output_tokens`。
   （`--no-cache` 指定時は `input_tokens + output_tokens` のみ＝キャッシュ分を除外。）
+- USD 計算では、上記 4 種別を合算前に保持し、`message.model` を価格表キーに解決して
+  `input×input_rate + output×output_rate + cache_creation×cache_write_rate + cache_read×cache_read_rate`
+  を per MTok レートで課金する。`--no-cache` 指定時は token と USD の両方から cache creation/read を除外する。
 
 ### 6.3 attribution（突き合わせ）
 **broad 一本**（`source == "mcp"` を委譲とみなす総和集計）。
@@ -125,6 +130,45 @@
 - 校正方法（任意・将来）: 代表タスクを「Claude インライン」と「Codex 委譲」両方で走らせ、
   `r = Claudeトークン / Codexトークン` を実測して `k=r` に差し替える。
 
+### 6.5 USD レイヤー
+
+USD は token 指標の補助値として併記する。トークン表示は既存のまま維持する。
+
+**overhead USD（実コスト寄り）**
+- Claude transcript の direct overhead assistant メッセージごとに `message.model` と
+  `message.usage.{input_tokens, output_tokens, cache_creation_input_tokens, cache_read_input_tokens}` を読む。
+- モデル別・4 種別別の per MTok レートで課金し、direct overhead 合算を `overhead_usd` として表示する。
+- 参考値の「Claude 全処理トークン」も同じ方法で `total_usd` を併記する。
+
+**回避分 USD（反実仮想）**
+- Codex 側には Claude の model や入出力内訳が無いため、`avoided_usd(k) = codex_tokens × k × counterfactual_input_rate / 1e6`
+  とする。
+- 既定の反実仮想モデルは `claude-opus-4-5`（input $5/MTok）。入力レートのみで保守的に概算し、
+  出力があれば上振れすることをレポートに注記する。
+- `net_savings_usd(k) = avoided_usd(k) − overhead_usd` を k 感度行ごとに表示する。
+
+**価格表**
+- 出典: `https://platform.claude.com/docs/about-claude/pricing`
+- 取得日: 2026-06-03
+- per MTok USD、5 分 cache write、cache read = hit。
+
+| 価格表キー | input | cache_write | cache_read | output |
+|---|---:|---:|---:|---:|
+| `claude-opus-4-8` / `claude-opus-4-7` / `claude-opus-4-6` / `claude-opus-4-5` | 5.00 | 6.25 | 0.50 | 25.00 |
+| `claude-opus-4-1` / `claude-opus-4` | 15.00 | 18.75 | 1.50 | 75.00 |
+| `claude-sonnet-4-6` / `claude-sonnet-4-5` / `claude-sonnet-4` | 3.00 | 3.75 | 0.30 | 15.00 |
+| `claude-haiku-4-5` | 1.00 | 1.25 | 0.10 | 5.00 |
+| `claude-3-5-haiku` | 0.80 | 1.00 | 0.08 | 4.00 |
+
+**CLI**
+- `--pricing PATH`: JSON で内蔵価格表を上書きマージする。
+- `--counterfactual-model NAME`: 回避分 USD に使う反実仮想モデルを切り替える。既定は `claude-opus-4-5`。
+
+**モデル解決**
+- `message.model` は最も具体的な価格表キーを優先して部分一致する。
+  優先順は opus 4.8 → 4.7 → 4.6 → 4.5 → 4.1 → 4、sonnet 4.6 → 4.5 → 4、haiku 4.5、haiku 3.5。
+- 解決できないモデルは `claude-sonnet-4-5` で fallback 課金し、fallback 対象 token 数と model 名をレポートに注記する。
+
 ## 7. コンポーネント分割
 
 `scripts/savings.py`（CLI、標準ライブラリのみ）。純粋関数で分割し単体テスト可能にする。
@@ -136,14 +180,16 @@
 | `collect_codex(root, since_utc, cwd_filter, cwd_exact)` | mcp 委譲のみ集約（id 名寄せ） | フィルタ | セッション dict の list |
 | `parse_claude_transcript(path)` | `message.id` dedupe→委譲ターンの usage 抽出（direct/全処理 の2値） | パス | overhead レコード list |
 | `collect_claude(root, since_utc)` | 全 transcript 集約 | フィルタ | overhead レコード list |
-| `compute(codex, claude, ks)` | 反実仮想・純節約を複数 k で算出 | 集計＋k 群 | レポート用 dict |
-| `render(report)` | 感度表＋Codex セッション一覧の整形 | dict | str |
+| `compute(codex, claude, ks)` | 反実仮想・純節約を複数 k で算出（token＋USD） | 集計＋k 群 | レポート用 dict |
+| `render(report)` | 感度表＋Codex セッション一覧の整形（token＋USD） | dict | str |
 | `main(argv)` | CLI 引数処理 | argv | 終了コード |
 
 CLI 例:
 ```
 python3 scripts/savings.py --since 2026-06-01 --cwd daily-news        # broad, UTC基準, 感度表
 python3 scripts/savings.py --cwd-exact /Users/yumaohno/daily-news
+python3 scripts/savings.py --counterfactual-model claude-sonnet-4-5
+python3 scripts/savings.py --pricing ./pricing-overrides.json
 python3 scripts/savings.py            # 全期間・全プロジェクト・broad・k 既定群(0.5/1/1.5/2)
 ```
 
@@ -153,16 +199,17 @@ python3 scripts/savings.py            # 全期間・全プロジェクト・broa
 codex-orchestration 節約レポート（UTC 2026-06-02〜06-03, attribution=broad[source:mcp]）
 委譲セッション数: 7   対象プロジェクト: daily-news, ...
 ─────────────────────────────────────────────
-Codex がやった仕事            : 1,240,000 tok   ← Pro 枠から外した分
-Claude overhead (狭義 direct) :    38,000 tok   ← 委譲の手間賃（純節約計算に使用）
-Claude 全処理トークン(参考)   :   210,000 tok   ← 文脈累積込みの上限的指標
+Codex がやった仕事            : 1,240,000 tok   (≈ $6.20 反実仮想 k=1.0)
+Claude overhead (狭義 direct) :    38,000 tok   (≈ $0.42 実コスト概算)
+Claude 全処理トークン(参考)   :   210,000 tok   (≈ $0.85 実コスト概算)
 ─────────────────────────────────────────────
 純節約 sensitivity（仮定 k に基づく反実仮想）:
-  k=0.5  ->   582,000 tok
-  k=1.0  -> 1,202,000 tok
-  k=1.5  -> 1,822,000 tok
-  k=2.0  -> 2,442,000 tok
+  k=0.5  ->   582,000 tok   (≈ $2.68)
+  k=1.0  -> 1,202,000 tok   (≈ $5.78)
+  k=1.5  -> 1,822,000 tok   (≈ $8.88)
+  k=2.0  -> 2,442,000 tok   (≈ $11.98)
 注: k は Claude/Codex 間の tokenizer・モデル挙動・cache 条件・委譲運用差を含む未校正係数。下限保証ではない。
+注: 回避分USDは反実仮想 claude-opus-4-5 入力レートのみの概算（出力があれば上振れ）。overhead USDは実transcriptのmodel別4種別課金。
 
 Codex 委譲セッション一覧（日付UTC / cwd / Codex トークン）:
   2026-06-03 07:29Z  daily-news/.claude/worktrees/...  Codex 61,285
@@ -172,6 +219,10 @@ Codex 委譲セッション一覧（日付UTC / cwd / Codex トークン）:
 ## 9. エッジケース / 注意
 
 - **トークン currency の差**: Claude と Codex はトークナイザ/モデルが異なる。合算は近似であり、`k` で吸収する旨をレポートに明記。
+- **USD の性質差**: overhead USD は実 transcript の model 別 token からの実コスト寄り概算。回避分 USD は
+  「もし Claude でやっていたら」の反実仮想であり、既定では Opus 4.5 の input レートだけを使う。
+- **未価格モデル**: `<synthetic>` 等、価格表に解決できない `message.model` は `claude-sonnet-4-5` で fallback 課金し、
+  fallback 対象 token 数と model 名を注記する。
 - **累積の非単調**: compaction/コンテキスト reset で `total_token_usage` が減ることがある。6.1 の増分和（`last_token_usage`）を既定にして回避。
 - **token 情報欠落セッション**: `last_token_usage` も `total_token_usage` も無いものは集計対象外。
 - **`source` キー欠落の古いセッション**: `source` 不明は集計対象外（mcp と確証できないため）。
@@ -193,6 +244,10 @@ Codex 委譲セッション一覧（日付UTC / cwd / Codex トークン）:
 - `parse_claude_transcript`: 1 メッセージ内に複数 `codex` tool_use があっても overhead を二重計上しない。
 - `collect_codex`: 同一 `id`（`codex-reply` 継続）が複数ファイルに跨っても 1 セッションに名寄せ。
 - `compute`: k=0.5/1.0/1.5/2.0 の感度値、純節約＝推定回避量−狭義 direct overhead が定義通り。
+- `parse_claude_transcript`: 実構造 fixture（`message.model` と `message.usage` 4 キー）から model 別 4 種別 USD が定義通り。
+- `parse_claude_transcript`: `--no-cache` 相当では cache creation/read を token と USD の両方から除外する。
+- `parse_claude_transcript` / `compute` / `render`: 未価格モデル fallback の token/model 注記。
+- `compute`: `--counterfactual-model` 相当で回避分 USD の input レートが切り替わる。
 - malformed JSONL 行を含む fixture → スキップして他行は集計継続。
 - すべて小さな JSONL fixture（実ログの一部を模した最小データ）で検証。実ホームのログには依存しない。
 

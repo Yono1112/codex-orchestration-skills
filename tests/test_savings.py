@@ -418,6 +418,71 @@ class ParseClaudeTranscriptTests(SavingsTestCase):
             self.assertEqual(records[0]["direct_tokens"], 15)
             self.assertEqual(records[0]["total_tokens"], 15)
 
+    def test_prices_direct_overhead_usd_from_real_message_usage_shape(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "project" / "session.jsonl"
+            self.write_jsonl(path, [
+                {"type": "assistant", "message": {
+                    "id": "msg-delegate",
+                    "model": "claude-opus-4-5-20251101",
+                    "usage": self.usage(1_000_000, 200_000, 3_000_000, 100_000),
+                    "content": [{
+                        "type": "tool_use",
+                        "name": "mcp__codex__codex",
+                        "id": "toolu_A",
+                        "input": {"prompt": "work"},
+                    }],
+                }},
+                {"type": "assistant", "message": {
+                    "id": "msg-ordinary",
+                    "model": "claude-sonnet-4-5-20250929",
+                    "usage": self.usage(1_000_000, 0, 0, 100_000),
+                    "content": [{"type": "text", "text": "ordinary text"}],
+                }},
+            ])
+
+            records = savings.parse_claude_transcript(path)
+
+            self.assertEqual(records[0]["direct_tokens"], 4_300_000)
+            self.assertAlmostEqual(records[0]["direct_usd"], 10.25)
+            self.assertEqual(records[0]["total_tokens"], 5_400_000)
+            self.assertAlmostEqual(records[0]["total_usd"], 14.75)
+
+    def test_no_cache_excludes_cache_tokens_from_usd(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "project" / "session.jsonl"
+            self.write_jsonl(path, [
+                {"type": "assistant", "message": {
+                    "id": "msg-1",
+                    "model": "claude-sonnet-4-5-20250929",
+                    "usage": self.usage(1_000_000, 2_000_000, 3_000_000, 100_000),
+                    "content": [{"type": "tool_use", "name": "mcp__codex__codex", "input": {"prompt": "work"}}],
+                }},
+            ])
+
+            records = savings.parse_claude_transcript(path, include_cache=False)
+
+            self.assertEqual(records[0]["direct_tokens"], 1_100_000)
+            self.assertAlmostEqual(records[0]["direct_usd"], 4.5)
+
+    def test_unpriced_models_use_fallback_and_report_tokens_and_model_names(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "project" / "session.jsonl"
+            self.write_jsonl(path, [
+                {"type": "assistant", "message": {
+                    "id": "msg-1",
+                    "model": "<synthetic>",
+                    "usage": self.usage(1_000_000, 0, 0, 100_000),
+                    "content": [{"type": "tool_use", "name": "mcp__codex__codex", "input": {"prompt": "work"}}],
+                }},
+            ])
+
+            records = savings.parse_claude_transcript(path)
+
+            self.assertAlmostEqual(records[0]["direct_usd"], 4.5)
+            self.assertEqual(records[0]["unpriced_fallback_tokens"], 1_100_000)
+            self.assertEqual(records[0]["unpriced_fallback_models"], ["<synthetic>"])
+
     def test_malformed_lines_are_skipped(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "project" / "session.jsonl"
@@ -481,8 +546,8 @@ class ComputeTests(SavingsTestCase):
             {"id": "codex-b", "cwd": "/repo/b", "codex_tokens": 300, "ts_utc": savings._parse_utc("2026-06-03T01:00:00Z")},
         ]
         claude = [
-            {"path": "one.jsonl", "direct_tokens": 50, "total_tokens": 200},
-            {"path": "two.jsonl", "direct_tokens": 10, "total_tokens": 30},
+            {"path": "one.jsonl", "direct_tokens": 50, "total_tokens": 200, "direct_usd": 0.50, "total_usd": 2.00},
+            {"path": "two.jsonl", "direct_tokens": 10, "total_tokens": 30, "direct_usd": 0.10, "total_usd": 0.30},
         ]
 
         report = savings.compute(codex, claude, ks=[0.5, 1.0, 2.0])
@@ -492,11 +557,39 @@ class ComputeTests(SavingsTestCase):
         self.assertEqual(report["codex_tokens"], 400)
         self.assertEqual(report["claude_direct_tokens"], 60)
         self.assertEqual(report["claude_total_tokens"], 230)
+        self.assertAlmostEqual(report["codex_counterfactual_usd"], 0.002)
+        self.assertAlmostEqual(report["claude_direct_usd"], 0.60)
+        self.assertAlmostEqual(report["claude_total_usd"], 2.30)
         self.assertEqual(report["sensitivity"], [
-            {"k": 0.5, "avoided_tokens": 200, "net_savings_tokens": 140},
-            {"k": 1.0, "avoided_tokens": 400, "net_savings_tokens": 340},
-            {"k": 2.0, "avoided_tokens": 800, "net_savings_tokens": 740},
+            {"k": 0.5, "avoided_tokens": 200, "net_savings_tokens": 140, "avoided_usd": 0.001, "net_savings_usd": -0.599},
+            {"k": 1.0, "avoided_tokens": 400, "net_savings_tokens": 340, "avoided_usd": 0.002, "net_savings_usd": -0.598},
+            {"k": 2.0, "avoided_tokens": 800, "net_savings_tokens": 740, "avoided_usd": 0.004, "net_savings_usd": -0.596},
         ])
+
+    def test_compute_allows_counterfactual_model_switch_and_accumulates_fallback_notes(self):
+        codex = [
+            {"id": "codex-a", "cwd": "/repo/a", "codex_tokens": 1_000_000, "ts_utc": savings._parse_utc("2026-06-03T00:00:00Z")},
+        ]
+        claude = [
+            {
+                "path": "one.jsonl",
+                "direct_tokens": 1_100_000,
+                "total_tokens": 1_100_000,
+                "direct_usd": 4.50,
+                "total_usd": 4.50,
+                "unpriced_fallback_tokens": 1_100_000,
+                "unpriced_fallback_models": ["<synthetic>"],
+            },
+        ]
+
+        report = savings.compute(codex, claude, ks=[1.0], counterfactual_model="claude-sonnet-4-5")
+
+        self.assertEqual(report["counterfactual_model"], "claude-sonnet-4-5")
+        self.assertAlmostEqual(report["codex_counterfactual_usd"], 3.0)
+        self.assertEqual(report["unpriced_fallback_tokens"], 1_100_000)
+        self.assertEqual(report["unpriced_fallback_models"], ["<synthetic>"])
+        self.assertAlmostEqual(report["sensitivity"][0]["avoided_usd"], 3.0)
+        self.assertAlmostEqual(report["sensitivity"][0]["net_savings_usd"], -1.5)
 
 
 class RenderTests(SavingsTestCase):
@@ -505,12 +598,18 @@ class RenderTests(SavingsTestCase):
             "attribution": "broad[source:mcp]",
             "codex_session_count": 1,
             "codex_tokens": 1240000,
+            "codex_counterfactual_usd": 6.20,
             "claude_direct_tokens": 38000,
+            "claude_direct_usd": 0.42,
             "claude_total_tokens": 210000,
+            "claude_total_usd": 0.85,
+            "counterfactual_model": "claude-opus-4-5",
+            "unpriced_fallback_tokens": 0,
+            "unpriced_fallback_models": [],
             "projects": ["/repo/daily-news"],
             "sensitivity": [
-                {"k": 0.5, "avoided_tokens": 620000, "net_savings_tokens": 582000},
-                {"k": 1.0, "avoided_tokens": 1240000, "net_savings_tokens": 1202000},
+                {"k": 0.5, "avoided_tokens": 620000, "net_savings_tokens": 582000, "avoided_usd": 3.10, "net_savings_usd": 2.68},
+                {"k": 1.0, "avoided_tokens": 1240000, "net_savings_tokens": 1202000, "avoided_usd": 6.20, "net_savings_usd": 5.78},
             ],
             "codex_sessions": [
                 {
@@ -526,15 +625,41 @@ class RenderTests(SavingsTestCase):
 
         self.assertIn("codex-orchestration 節約レポート（UTC since 2026-06-02T00:00:00Z, attribution=broad[source:mcp]）", text)
         self.assertIn("委譲セッション数: 1", text)
-        self.assertIn("Codex がやった仕事            : 1,240,000 tok", text)
-        self.assertIn("Claude overhead (狭義 direct) : 38,000 tok", text)
-        self.assertIn("Claude 全処理トークン(参考)   : 210,000 tok", text)
-        self.assertIn("k=0.5  -> 582,000 tok", text)
-        self.assertIn("k=1.0  -> 1,202,000 tok", text)
+        self.assertIn("Codex がやった仕事            : 1,240,000 tok   (≈ $6.20 反実仮想 k=1.0)", text)
+        self.assertIn("Claude overhead (狭義 direct) : 38,000 tok   (≈ $0.42 実コスト概算)", text)
+        self.assertIn("Claude 全処理トークン(参考)   : 210,000 tok   (≈ $0.85 実コスト概算)", text)
+        self.assertIn("k=0.5  -> 582,000 tok   (≈ $2.68)", text)
+        self.assertIn("k=1.0  -> 1,202,000 tok   (≈ $5.78)", text)
         self.assertIn("下限保証ではない", text)
+        self.assertIn("回避分USDは反実仮想 claude-opus-4-5 入力レートのみの概算", text)
+        self.assertIn("overhead USDは実transcriptのmodel別4種別課金", text)
         self.assertIn("残存ログのみが対象", text)
         self.assertIn("Codex セッション一覧（日付UTC / cwd / Codex トークン）:", text)
         self.assertIn("2026-06-03T07:29:00Z  /repo/daily-news  Codex 61,285", text)
+
+    def test_render_notes_unpriced_fallback_models(self):
+        report = {
+            "attribution": "broad[source:mcp]",
+            "codex_session_count": 0,
+            "codex_tokens": 0,
+            "codex_counterfactual_usd": 0.0,
+            "claude_direct_tokens": 1100000,
+            "claude_direct_usd": 4.50,
+            "claude_total_tokens": 1100000,
+            "claude_total_usd": 4.50,
+            "counterfactual_model": "claude-opus-4-5",
+            "unpriced_fallback_tokens": 1100000,
+            "unpriced_fallback_models": ["<synthetic>"],
+            "projects": [],
+            "sensitivity": [
+                {"k": 1.0, "avoided_tokens": 0, "net_savings_tokens": -1100000, "avoided_usd": 0.0, "net_savings_usd": -4.5},
+            ],
+            "codex_sessions": [],
+        }
+
+        text = savings.render(report)
+
+        self.assertIn("unpriced(fallback) tokens: 1,100,000, models: <synthetic>", text)
 
 
 class MainTests(SavingsTestCase):
