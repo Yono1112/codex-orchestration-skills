@@ -344,6 +344,43 @@ class ParseClaudeTranscriptTests(SavingsTestCase):
             self.assertEqual(records[0]["total_tokens"], 185)
             self.assertEqual(records[0]["tool_use_count"], 1)
 
+    def test_any_matching_tool_result_item_marks_next_assistant_direct(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "project" / "session.jsonl"
+            self.write_jsonl(path, [
+                {"type": "assistant", "message": {
+                    "id": "msg-delegate",
+                    "usage": self.usage(10, 0, 0, 2),
+                    "content": [{
+                        "type": "tool_use",
+                        "name": "mcp__codex__codex",
+                        "id": "toolu_A",
+                        "input": {"prompt": "work"},
+                    }],
+                }},
+                {"type": "user", "message": {"content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "toolu_OTHER",
+                        "content": "unrelated",
+                    },
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "toolu_A",
+                        "content": "completed",
+                    },
+                ]}},
+                {"type": "assistant", "message": {
+                    "id": "msg-review",
+                    "usage": self.usage(20, 0, 0, 3),
+                    "content": [{"type": "text", "text": "review result"}],
+                }},
+            ])
+
+            records = savings.parse_claude_transcript(path)
+
+            self.assertEqual(records[0]["direct_tokens"], 35)
+
     def test_ignores_non_codex_messages_for_direct_overhead_but_keeps_session_total_when_delegation_exists(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "project" / "session.jsonl"

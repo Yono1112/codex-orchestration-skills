@@ -30,8 +30,13 @@ def _parse_utc(value: str | None) -> datetime | None:
     return parsed.astimezone(timezone.utc)
 
 
+def _usage_container(payload: dict[str, Any]) -> dict[str, Any]:
+    info = payload.get("info")
+    return info if isinstance(info, dict) else payload
+
+
 def _nested_total_tokens(payload: dict[str, Any], key: str) -> int | None:
-    usage = payload.get(key)
+    usage = _usage_container(payload).get(key)
     if not isinstance(usage, dict):
         return None
     value = usage.get("total_tokens")
@@ -168,22 +173,22 @@ def _is_codex_tool_use(item: Any) -> bool:
     return isinstance(item, dict) and item.get("type") == "tool_use" and item.get("name") in CODEX_TOOL_NAMES
 
 
-def _contains_codex_marker(value: Any) -> bool:
-    if isinstance(value, dict):
-        return any(_contains_codex_marker(child) for child in value.values())
-    if isinstance(value, list):
-        return any(_contains_codex_marker(child) for child in value)
-    if isinstance(value, str):
-        lowered = value.lower()
-        return "codex" in lowered or "threadid" in lowered
-    return False
+def _codex_tool_use_id(item: Any) -> str | None:
+    if not _is_codex_tool_use(item):
+        return None
+    tool_use_id = item.get("id")
+    return tool_use_id if isinstance(tool_use_id, str) else None
 
 
-def _row_has_codex_tool_result(row: dict[str, Any]) -> bool:
+def _row_has_codex_tool_result(row: dict[str, Any], codex_tool_use_ids: set[str]) -> bool:
     message = _message_from_row(row)
     for item in _content_items(message):
-        if isinstance(item, dict) and item.get("type") == "tool_result":
-            return _contains_codex_marker(item)
+        if (
+            isinstance(item, dict)
+            and item.get("type") == "tool_result"
+            and item.get("tool_use_id") in codex_tool_use_ids
+        ):
+            return True
     return False
 
 
@@ -194,6 +199,7 @@ def parse_claude_transcript(
 ) -> list[dict[str, Any]]:
     unique_messages: list[dict[str, Any]] = []
     seen_message_keys: set[str] = set()
+    codex_tool_use_ids: set[str] = set()
     next_assistant_is_direct = False
 
     for index, row in enumerate(_read_jsonl(Path(path))):
@@ -202,7 +208,7 @@ def parse_claude_transcript(
         if row.get("isSidechain") and not include_sidechains:
             continue
 
-        if _row_has_codex_tool_result(row):
+        if _row_has_codex_tool_result(row, codex_tool_use_ids):
             next_assistant_is_direct = True
             continue
 
@@ -210,13 +216,16 @@ def parse_claude_transcript(
             continue
 
         message = _message_from_row(row)
+        content = _content_items(message)
+        codex_tool_items = [item for item in content if _is_codex_tool_use(item)]
+        for tool_use_id in (_codex_tool_use_id(item) for item in codex_tool_items):
+            if tool_use_id is not None:
+                codex_tool_use_ids.add(tool_use_id)
+
         key = _message_key(row, message, index)
         if key in seen_message_keys:
             continue
         seen_message_keys.add(key)
-
-        content = _content_items(message)
-        codex_tool_items = [item for item in content if _is_codex_tool_use(item)]
 
         is_direct = bool(codex_tool_items) or next_assistant_is_direct
         next_assistant_is_direct = False
